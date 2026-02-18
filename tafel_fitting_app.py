@@ -1,9 +1,18 @@
 """
-Tafel Fitting Tool — v3: Global Multi-Region Electrochemical Model
-===================================================================
-Auto-detects curve type → extracts initial guesses from local analysis →
-fits a GLOBAL model across the ENTIRE polarization curve (active + passive
-+ transpassive + diffusion-limited) → single fit line overlays all data.
+Tafel Fitting Tool — v4: Comprehensive Global Electrochemical Model
+====================================================================
+Handles ALL electrochemically possible polarization curve types:
+  • Active only (simple BV)
+  • Active + diffusion-limited cathodic
+  • Active + passive (with active dissolution peak / nose)
+  • Active + passive + transpassive
+  • Active + passive + transpassive + secondary passivity
+  • Active + passive + pitting (sharp breakdown)
+  • Any combination with cathodic diffusion limitation
+
+Physics-based model with film-coverage approach for passivation.
+Multi-stage optimization: DE → Basin-hopping → L-BFGS-B → Nelder-Mead.
+Automatic data quality diagnostics.
 """
 
 import streamlit as st
@@ -11,265 +20,287 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from scipy.optimize import curve_fit, differential_evolution, minimize
-from scipy.signal import savgol_filter
+from scipy.optimize import (curve_fit, differential_evolution, minimize,
+                             dual_annealing)
+from scipy.signal import savgol_filter, argrelextrema
 from scipy.stats import linregress
+from scipy.ndimage import uniform_filter1d
 from itertools import groupby
-import warnings, io, re
+import warnings, io, re, time
 
 warnings.filterwarnings("ignore")
 
 # ═══════════════════════════════════════════════════════════════
 # PAGE CONFIG & STYLING
 # ═══════════════════════════════════════════════════════════════
-st.set_page_config(page_title="Tafel Fitting v3", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Tafel v4", page_icon="⚡", layout="wide")
 
 st.markdown("""
 <style>
-body, [data-testid="stAppViewContainer"]  { background:#13131f; color:#cdd6f4; }
-[data-testid="stSidebar"]                 { background:#1a1a2e; }
-section[data-testid="stFileUploadDropzone"] { background:#1e1e2e !important;
-    border:2px dashed #45475a !important; border-radius:12px !important; }
-.pcard { background:#1e1e2e; border:1px solid #313244; border-radius:10px;
-         padding:14px 16px; margin:4px 0; }
-.plabel { color:#a6adc8; font-size:10px; font-weight:700; letter-spacing:.8px;
-          text-transform:uppercase; }
-.pval   { font-size:21px; font-weight:700; margin:1px 0; }
-.punit  { color:#585b70; font-size:11px; }
-.sechead { color:#89b4fa; font-size:12px; font-weight:700; letter-spacing:1px;
-           text-transform:uppercase; border-bottom:1px solid #313244;
-           padding-bottom:5px; margin:14px 0 6px; }
-.badge  { display:inline-block; padding:2px 9px; border-radius:20px;
-          font-size:10px; font-weight:700; margin:1px 2px; }
-.bg  { background:#1c3a2f; color:#a6e3a1; border:1px solid #a6e3a1; }
-.bb  { background:#1a2a3f; color:#89b4fa; border:1px solid #89b4fa; }
-.by  { background:#3a3020; color:#f9e2af; border:1px solid #f9e2af; }
-.br  { background:#3a1a20; color:#f38ba8; border:1px solid #f38ba8; }
-.bp  { background:#2a1a3a; color:#cba6f7; border:1px solid #cba6f7; }
-.ok-box  { background:#1e1e2e; border-left:4px solid #a6e3a1; border-radius:0 8px 8px 0;
-           padding:8px 14px; margin:6px 0; font-size:12px; color:#cdd6f4; }
-.warn-box{ background:#1e1e2e; border-left:4px solid #f9e2af; border-radius:0 8px 8px 0;
-           padding:8px 14px; margin:6px 0; font-size:12px; color:#f9e2af; }
-.type-box{ background:linear-gradient(135deg,#1e1e2e,#232336);
-           border:1px solid #45475a; border-radius:10px;
-           padding:14px 18px; margin:8px 0; }
-.type-title{ font-size:16px; font-weight:700; margin-bottom:4px; }
-.type-desc { font-size:12px; color:#a6adc8; }
-</style>
-""", unsafe_allow_html=True)
+body,[data-testid="stAppViewContainer"]{background:#0f0f1a;color:#cdd6f4}
+[data-testid="stSidebar"]{background:#1a1a2e}
+section[data-testid="stFileUploadDropzone"]{background:#1e1e2e!important;
+  border:2px dashed #45475a!important;border-radius:12px!important}
+.pcard{background:#1e1e2e;border:1px solid #313244;border-radius:10px;padding:14px 16px;margin:4px 0}
+.plabel{color:#a6adc8;font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase}
+.pval{font-size:21px;font-weight:700;margin:1px 0}
+.punit{color:#585b70;font-size:11px}
+.sechead{color:#89b4fa;font-size:12px;font-weight:700;letter-spacing:1px;
+  text-transform:uppercase;border-bottom:1px solid #313244;padding-bottom:5px;margin:14px 0 6px}
+.badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:10px;font-weight:700;margin:1px 2px}
+.bg{background:#1c3a2f;color:#a6e3a1;border:1px solid #a6e3a1}
+.bb{background:#1a2a3f;color:#89b4fa;border:1px solid #89b4fa}
+.by{background:#3a3020;color:#f9e2af;border:1px solid #f9e2af}
+.br{background:#3a1a20;color:#f38ba8;border:1px solid #f38ba8}
+.bp{background:#2a1a3a;color:#cba6f7;border:1px solid #cba6f7}
+.ok-box{background:#1e1e2e;border-left:4px solid #a6e3a1;border-radius:0 8px 8px 0;
+  padding:8px 14px;margin:6px 0;font-size:12px;color:#cdd6f4}
+.warn-box{background:#1e1e2e;border-left:4px solid #f9e2af;border-radius:0 8px 8px 0;
+  padding:8px 14px;margin:6px 0;font-size:12px;color:#f9e2af}
+.err-box{background:#1e1e2e;border-left:4px solid #f38ba8;border-radius:0 8px 8px 0;
+  padding:8px 14px;margin:6px 0;font-size:12px;color:#f38ba8}
+.type-box{background:linear-gradient(135deg,#1e1e2e,#232336);
+  border:1px solid #45475a;border-radius:10px;padding:14px 18px;margin:8px 0}
+.type-title{font-size:16px;font-weight:700;margin-bottom:4px}
+.type-desc{font-size:12px;color:#a6adc8}
+.diag-box{background:#1e1e2e;border:1px solid #313244;border-radius:10px;
+  padding:14px 18px;margin:6px 0}
+.diag-title{font-size:13px;font-weight:700;margin-bottom:6px}
+.diag-item{font-size:12px;color:#a6adc8;padding:3px 0}
+</style>""", unsafe_allow_html=True)
 
 C = dict(
-    data="#89b4fa", anodic="#f9e2af", cathodic="#cba6f7", bv="#a6e3a1",
-    global_fit="#a6e3a1",
-    passive="rgba(166,227,161,0.12)", limiting="rgba(137,220,235,0.12)",
-    transpassive="rgba(243,188,168,0.10)", ecorr="#f38ba8",
-    grid="#313244", bg="#1e1e2e", paper="#181825", text="#cdd6f4",
-    fit_band="rgba(166,227,161,0.10)",
+    data="#89b4fa", anodic="#f9e2af", cathodic="#cba6f7", fit="#a6e3a1",
+    passive="rgba(166,227,161,0.10)", limiting="rgba(137,220,235,0.10)",
+    transpassive="rgba(243,188,168,0.08)", sec_passive="rgba(203,166,247,0.08)",
+    ecorr="#f38ba8", grid="#313244", bg="#1e1e2e", paper="#131320", text="#cdd6f4",
 )
 
-
 # ═══════════════════════════════════════════════════════════════
-# COLUMN AUTO-DETECTION & FILE LOADING
+# FILE I/O  (same as v3, compact)
 # ═══════════════════════════════════════════════════════════════
-COLUMN_SIGNATURES = [
-    (r"we.*potential", r"we.*current", "A"),
-    (r"ewe",           r"i/ma",        "mA"),
-    (r"ewe",           r"<i>/ma",      "mA"),
-    (r"^vf$",          r"^im$",        "A"),
-    (r"potential/v",   r"current/a",   "A"),
-    (r"e/v",           r"i/a",         "A"),
-    (r"potential|volt|^e$|e \(v\)|e_v",
-     r"current|amps|^i$|i \(a\)|i_a",  "A"),
-    (r"potential|volt|^e$",
-     r"current.*ma|ima",               "mA"),
+COL_SIG = [
+    (r"we.*potential", r"we.*current", "A"), (r"ewe", r"i/ma", "mA"),
+    (r"ewe", r"<i>/ma", "mA"), (r"^vf$", r"^im$", "A"),
+    (r"potential/v", r"current/a", "A"), (r"e/v", r"i/a", "A"),
+    (r"potential|volt|^e$|e \(v\)|e_v", r"current|amps|^i$|i \(a\)|i_a", "A"),
+    (r"potential|volt|^e$", r"current.*ma|ima", "mA"),
 ]
-UNIT_HINTS = {
-    r"\(a\)|_a$|/a$": 1.0, r"\(ma\)|_ma$|/ma$": 1e-3,
-    r"\(µa\)|_ua$|/ua$": 1e-6, r"a/cm": 1.0, r"ma/cm": 1e-3,
-}
+UHINT = {r"\(a\)|_a$|/a$":1.0, r"\(ma\)|_ma$|/ma$":1e-3,
+         r"\(µa\)|_ua$|/ua$":1e-6, r"a/cm":1.0, r"ma/cm":1e-3}
 
 
 def auto_detect_columns(df):
-    cols_lower = {c: c.lower().strip() for c in df.columns}
-    numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    for E_pat, I_pat, unit in COLUMN_SIGNATURES:
-        e_match = [c for c, cl in cols_lower.items()
-                   if re.search(E_pat, cl) and c in numeric]
-        i_match = [c for c, cl in cols_lower.items()
-                   if re.search(I_pat, cl) and c in numeric and c not in e_match]
-        if e_match and i_match:
-            e_col = sorted(e_match,
-                           key=lambda c: 0 if "we" in c.lower() or "meas" in c.lower() else 1)[0]
-            i_col = i_match[0]
-            factor = 1e-3 if unit == "mA" else 1.0
-            for pat, f in UNIT_HINTS.items():
-                if re.search(pat, cols_lower[i_col]):
-                    factor = f; break
-            return e_col, i_col, factor
-    if len(numeric) >= 2:
-        return numeric[0], numeric[1], 1.0
-    raise ValueError("Could not find potential and current columns.")
-
-
-def detect_file_skiprows(raw_bytes, ext):
-    if ext in (".xlsx", ".xls"):
-        return 0
-    text = raw_bytes.decode("utf-8", errors="replace")
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        parts = re.split(r"[,;\t ]+", line.strip())
-        nc = sum(1 for p in parts if re.match(r"^-?[\d.eE+]+$", p))
-        if nc >= 2:
-            return max(0, i - 1) if i > 0 and not any(
-                re.match(r"^-?[\d.eE+]+$", p)
-                for p in re.split(r"[,;\t ]+", lines[i-1].strip())) else i
-    return 0
+    cl = {c: c.lower().strip() for c in df.columns}
+    num = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    for Ep, Ip, u in COL_SIG:
+        em = [c for c, v in cl.items() if re.search(Ep, v) and c in num]
+        im = [c for c, v in cl.items() if re.search(Ip, v) and c in num and c not in em]
+        if em and im:
+            ec = sorted(em, key=lambda c: 0 if "we" in c.lower() else 1)[0]
+            ic = im[0]
+            f = 1e-3 if u == "mA" else 1.0
+            for p, fv in UHINT.items():
+                if re.search(p, cl[ic]): f = fv; break
+            return ec, ic, f
+    if len(num) >= 2: return num[0], num[1], 1.0
+    raise ValueError("Could not detect columns.")
 
 
 def load_any_file(f):
-    name = f.name.lower()
-    ext = next((e for e in (".xlsx", ".xls", ".csv", ".txt") if name.endswith(e)), ".csv")
+    nm = f.name.lower()
+    ext = next((e for e in (".xlsx",".xls",".csv",".txt") if nm.endswith(e)), ".csv")
     raw = f.read(); f.seek(0)
-    if ext in (".xlsx", ".xls"):
-        return pd.read_excel(io.BytesIO(raw))
-    skip = detect_file_skiprows(raw, ext)
+    if ext in (".xlsx",".xls"): return pd.read_excel(io.BytesIO(raw))
     text = raw.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    skip = 0
+    for idx, line in enumerate(lines):
+        pts = re.split(r"[,;\t ]+", line.strip())
+        if sum(1 for p in pts if re.match(r"^-?[\d.eE+]+$", p)) >= 2:
+            skip = max(0, idx - 1) if idx > 0 and not any(
+                re.match(r"^-?[\d.eE+]+$", p)
+                for p in re.split(r"[,;\t ]+", lines[idx-1].strip())) else idx
+            break
     for sep in ["\t", ";", ",", r"\s+"]:
         try:
             df = pd.read_csv(io.StringIO(text), sep=sep, skiprows=skip, engine="python")
             if df.shape[1] >= 2 and df.shape[0] > 5:
                 return df.dropna(axis=1, how="all")
-        except Exception:
-            pass
-    raise ValueError(f"Unable to parse {f.name}")
+        except: pass
+    raise ValueError(f"Cannot parse {f.name}")
 
 
 # ═══════════════════════════════════════════════════════════════
 # MATH HELPERS
 # ═══════════════════════════════════════════════════════════════
+def safe_log(x): return np.log10(np.maximum(np.abs(x), 1e-20))
 
-def safe_log10(x):
-    return np.log10(np.maximum(np.abs(x), 1e-20))
+def smooth(y, w=11, p=3):
+    n = len(y); w = min(w, n if n%2==1 else n-1)
+    return savgol_filter(y, w, min(p, w-1)) if w >= 5 else y.copy()
 
-def smooth(y, window=11, poly=3):
-    n = len(y)
-    w = min(window, n if n % 2 == 1 else n - 1)
-    return savgol_filter(y, w, min(poly, w - 1)) if w >= 5 else y.copy()
+def _r2(yt, yp):
+    sr = np.sum((yt-yp)**2); st_ = np.sum((yt-yt.mean())**2)
+    return float(max(0, 1-sr/st_)) if st_ > 0 else 0.0
 
-def _r2(y_true, y_pred):
-    ss_r = np.sum((y_true - y_pred)**2)
-    ss_t = np.sum((y_true - y_true.mean())**2)
-    return float(max(0, 1 - ss_r / ss_t)) if ss_t > 0 else 0.0
+def sigmoid(x, k=1.0):
+    return 1.0 / (1.0 + np.exp(-np.clip(k * x, -50, 50)))
 
 
 # ═══════════════════════════════════════════════════════════════
-# GLOBAL ELECTROCHEMICAL MODEL
+# GLOBAL ELECTROCHEMICAL MODEL  — v4
 # ═══════════════════════════════════════════════════════════════
 #
-# Physics-based model covering all regions of a polarization curve:
+# Complete physics-based model using film-coverage approach:
 #
-#   i_total = i_anodic − i_cathodic + i_transpassive
+#   i_net = i_anodic_total − i_cathodic
 #
-# Where:
-#   Anodic:  i_a_kinetic = icorr · exp(2.303·η/ba)
-#            i_anodic = i_a_kinetic · ipass / (i_a_kinetic + ipass)
-#            → At low η: pure Tafel (i_a_kinetic << ipass)
-#            → At high η: saturates at ipass (passive film limits current)
+# ── CATHODIC ──────────────────────────────────────────────────
+#   i_c_kinetic = icorr · exp(−2.303·η/bc)
+#   i_cathodic  = i_c_kinetic / (1 + i_c_kinetic/iL)
+#     → Tafel at low |η|, saturates at iL for mass-transport limit
 #
-#   Cathodic: i_c_kinetic = icorr · exp(−2.303·η/bc)
-#             i_cathodic = i_c_kinetic / (1 + i_c_kinetic / iL)
-#             → At low |η|: pure Tafel
-#             → At high |η|: saturates at iL (mass-transport limited)
+# ── ANODIC  ───────────────────────────────────────────────────
+#   Uses film-coverage model:
 #
-#   Transpassive: i_tp = a_tp · exp(b_tp · (E − Eb)) · sigmoid(E − Eb)
-#             → Zero below Eb, exponential rise above
+#   i_active = icorr · exp(2.303·η/ba)        ← activation kinetics
 #
-# This model naturally reduces to simpler cases:
-#   • ipass → ∞:  no passivation (active-only system)
-#   • iL → ∞:     no diffusion limitation
-#   • a_tp → 0:   no transpassive region
+#   θ₁(E) = sigmoid(k₁·(E − Epp))           ← primary passive film coverage
+#   i_after_pass1 = i_active·(1−θ₁) + ipass·θ₁
+#     → Below Epp: pure Tafel (active dissolution)
+#     → At Epp: peak (the "nose" — i_active rises but θ₁ turns on)
+#     → Above Epp: drops to ipass (passive plateau)
+#
+#   i_transpassive = a_tp · exp(b_tp·(E−Eb)) · sigmoid(k_tp·(E−Eb))
+#     → Exponential rise above breakdown Eb
+#
+#   θ₂(E) = sigmoid(k₂·(E − Esp))           ← secondary passive film
+#   i_anodic_total = (i_after_pass1 + i_tp)·(1−θ₂) + ipass2·θ₂
+#     → Above Esp: drops to ipass2 (secondary passivity)
+#
+# ── PARAMETER REDUCTION ──────────────────────────────────────
+#   Active only:     k₁→0, a_tp→0, k₂→0     (12→4 effective params)
+#   + diffusion:     add iL                    (12→5)
+#   + passive:       add k₁, Epp, ipass        (12→7-8)
+#   + transpassive:  add Eb, a_tp, b_tp        (12→10-11)
+#   + secondary:     add Esp, ipass2, k₂        (full 12+)
 # ═══════════════════════════════════════════════════════════════
 
-def global_model(E, Ecorr, icorr, ba, bc, ipass, iL, Eb, a_tp, b_tp):
+# Fixed parameter order (14 params):
+# [Ecorr, icorr, ba, bc, iL, Epp, k_pass, ipass, Eb, a_tp, b_tp, Esp, k_sp, ipass2]
+PARAM_NAMES = ["Ecorr", "icorr", "ba", "bc", "iL",
+               "Epp", "k_pass", "ipass",
+               "Eb", "a_tp", "b_tp",
+               "Esp", "k_sp", "ipass2"]
+N_PARAMS = len(PARAM_NAMES)
+
+
+def global_model(E, p):
     """
-    Global multi-region polarization curve model.
-
-    Parameters:
-        Ecorr  : corrosion potential (V)
-        icorr  : corrosion current density (A/cm²)
-        ba     : anodic Tafel slope (V/decade)
-        bc     : cathodic Tafel slope (V/decade)
-        ipass  : passive current density (A/cm²)
-        iL     : cathodic limiting current density (A/cm²)
-        Eb     : breakdown / transpassive potential (V)
-        a_tp   : transpassive pre-exponential (A/cm²)
-        b_tp   : transpassive exponential factor (V⁻¹)
+    Full global polarization curve model.
+    p = [Ecorr, icorr, ba, bc, iL,
+         Epp, k_pass, ipass,
+         Eb, a_tp, b_tp,
+         Esp, k_sp, ipass2]
     """
+    Ecorr, icorr, ba, bc, iL = p[0], p[1], p[2], p[3], p[4]
+    Epp, k_pass, ipass = p[5], p[6], p[7]
+    Eb, a_tp, b_tp = p[8], p[9], p[10]
+    Esp, k_sp, ipass2 = p[11], p[12], p[13]
+
     eta = E - Ecorr
 
-    # ── Anodic: activation kinetics → passive-limited ────
-    i_a_kin = icorr * np.exp(2.303 * eta / ba)
-    # Harmonic transition: naturally saturates at ipass
-    i_anodic = i_a_kin * ipass / (i_a_kin + ipass)
-
-    # ── Cathodic: activation kinetics → diffusion-limited ─
+    # ── Cathodic: Tafel → diffusion limited ──────────────
     i_c_kin = icorr * np.exp(-2.303 * eta / bc)
     i_cathodic = i_c_kin / (1.0 + i_c_kin / iL)
 
-    # ── Transpassive: exponential rise above Eb ──────────
-    # Smooth sigmoid turn-on at Eb (width ~30 mV)
-    sigmoid_tp = 1.0 / (1.0 + np.exp(-40.0 * (E - Eb)))
-    i_tp = a_tp * np.exp(np.clip(b_tp * (E - Eb), -50, 50)) * sigmoid_tp
+    # ── Anodic: active dissolution kinetics ──────────────
+    i_active = icorr * np.exp(2.303 * eta / ba)
 
-    return i_anodic - i_cathodic + i_tp
+    # ── Primary passivation (film coverage θ₁) ──────────
+    theta1 = sigmoid(E - Epp, k_pass)
+    i_after_pass1 = i_active * (1.0 - theta1) + ipass * theta1
+
+    # ── Transpassive dissolution ─────────────────────────
+    i_tp = a_tp * np.exp(np.clip(b_tp * (E - Eb), -50, 50)) * sigmoid(E - Eb, 40.0)
+
+    # ── Secondary passivation (film coverage θ₂) ────────
+    theta2 = sigmoid(E - Esp, k_sp)
+
+    # ── Combine anodic ──────────────────────────────────
+    i_anodic_total = (i_after_pass1 + i_tp) * (1.0 - theta2) + ipass2 * theta2
+
+    return i_anodic_total - i_cathodic
 
 
-def global_model_log(E, Ecorr, icorr_log, ba, bc, ipass_log, iL_log,
-                     Eb, a_tp_log, b_tp):
-    """Same model but with log-scaled current parameters for better optimization."""
-    return global_model(E, Ecorr, 10**icorr_log, ba, bc,
-                        10**ipass_log, 10**iL_log, Eb, 10**a_tp_log, b_tp)
-
-
-def butler_volmer(E, Ecorr, icorr, ba, bc):
-    """Standard BV for local active-region fitting."""
+def global_model_components(E, p):
+    """Return individual components for visualization."""
+    Ecorr, icorr, ba, bc, iL = p[0:5]
+    Epp, k_pass, ipass = p[5:8]
+    Eb, a_tp, b_tp = p[8:11]
+    Esp, k_sp, ipass2 = p[11:14]
     eta = E - Ecorr
-    return icorr * (np.exp(2.303 * eta / ba) - np.exp(-2.303 * eta / bc))
+
+    i_c_kin = icorr * np.exp(-2.303 * eta / bc)
+    i_cathodic = i_c_kin / (1.0 + i_c_kin / iL)
+    i_active = icorr * np.exp(2.303 * eta / ba)
+    theta1 = sigmoid(E - Epp, k_pass)
+    i_after_pass1 = i_active * (1.0 - theta1) + ipass * theta1
+    i_tp = a_tp * np.exp(np.clip(b_tp * (E - Eb), -50, 50)) * sigmoid(E - Eb, 40.0)
+    theta2 = sigmoid(E - Esp, k_sp)
+    i_anodic_total = (i_after_pass1 + i_tp) * (1.0 - theta2) + ipass2 * theta2
+
+    return dict(
+        i_cathodic=i_cathodic, i_active=i_active,
+        i_after_pass1=i_after_pass1, i_tp=i_tp,
+        i_anodic_total=i_anodic_total,
+        theta1=theta1, theta2=theta2,
+        i_total=i_anodic_total - i_cathodic,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
 # CURVE TYPE CLASSIFICATION
 # ═══════════════════════════════════════════════════════════════
 
-class CurveType:
-    ACTIVE_ONLY = "active_only"
+class CT:
+    ACTIVE = "active"
+    ACTIVE_DIFF = "active_diff"
     PASSIVE = "passive"
-    DIFFUSION_LIMITED = "diffusion_limited"
-    MIXED = "mixed"
+    PASSIVE_DIFF = "passive_diff"
+    PASSIVE_TP = "passive_tp"
+    PASSIVE_TP_SP = "passive_tp_sp"      # with secondary passivity
+    PASSIVE_PITTING = "passive_pitting"   # sharp breakdown
+    FULL = "full"                          # everything
 
-    DESCRIPTIONS = {
-        ACTIVE_ONLY: ("⚡ Active / Standard Tafel",
-                      "Pure activation-controlled. Global model with ipass→∞, iL→∞."),
-        PASSIVE: ("🛡️ Passive System",
-                  "Anodic passivation detected. Global model includes active→passive "
-                  "transition and transpassive rise."),
-        DIFFUSION_LIMITED: ("🌊 Diffusion-Limited Cathodic",
-                            "Cathodic mass-transport limitation. Global model includes "
-                            "diffusion-corrected cathodic branch."),
-        MIXED: ("🔀 Mixed: Passive + Diffusion-Limited",
-                "Both features detected. Full global model with all terms active."),
+    DESC = {
+        "active":          ("⚡ Active Only",
+                            "Pure activation kinetics on both branches. Standard Butler-Volmer."),
+        "active_diff":     ("⚡🌊 Active + Diffusion-Limited",
+                            "Active kinetics with cathodic mass-transport limitation."),
+        "passive":         ("🛡️ Active–Passive",
+                            "Active dissolution peak (nose) → passive plateau."),
+        "passive_diff":    ("🛡️🌊 Active–Passive + Diffusion",
+                            "Passivating system with cathodic diffusion limitation."),
+        "passive_tp":      ("🛡️💥 Active–Passive–Transpassive",
+                            "Passive plateau with transpassive dissolution above Eb."),
+        "passive_tp_sp":   ("🛡️💥🟣 Full: Passive–Transpassive–Secondary Passive",
+                            "Complete multi-region: active → passive → transpassive → secondary passivity."),
+        "passive_pitting": ("🛡️⚡ Passive with Pitting Breakdown",
+                            "Passive region terminated by sharp pitting at Epit."),
+        "full":            ("🔀 Full Multi-Region",
+                            "All regions detected: active, passive, transpassive, limiting, secondary."),
     }
 
 
 # ═══════════════════════════════════════════════════════════════
-# REGION DETECTION
+# REGION DETECTION (comprehensive)
 # ═══════════════════════════════════════════════════════════════
 
 def detect_regions(E, i):
-    """Detect Ecorr, passive region, limiting current, breakdown potential."""
-    reg = {}
-    n = len(E)
-    abs_i = np.abs(i)
+    """Comprehensive region detection with peak finding for active dissolution nose."""
+    reg = {}; n = len(E); abs_i = np.abs(i)
 
     # ── Ecorr ───────────────────────────────────────────
     sc = np.where(np.diff(np.sign(i)))[0]
@@ -278,1154 +309,1089 @@ def detect_regions(E, i):
         reg["Ecorr"] = float(E[k] - i[k]*(E[k+1]-E[k])/d) if abs(d) > 0 else float(E[k])
         reg["ecorr_idx"] = k
     else:
-        k = int(np.argmin(np.abs(i)))
+        k = int(np.argmin(abs_i))
         reg["Ecorr"] = float(E[k]); reg["ecorr_idx"] = k
-
     Ec = reg["Ecorr"]
 
-    # ── Cathodic limiting current ───────────────────────
+    # ── Cathodic limiting ───────────────────────────────
     ci = np.where(E < Ec)[0]
     if len(ci) >= 8:
-        log_c = smooth(safe_log10(abs_i[ci]), min(11, (len(ci)//2)*2-1 or 5))
-        dlog = np.abs(np.gradient(log_c, E[ci]))
-        threshold = np.percentile(dlog, 20)
-        flat = dlog < max(threshold, 0.5)
-        runs = [(k, list(g)) for k, g in groupby(enumerate(flat), key=lambda x: x[1]) if k]
+        lc = smooth(safe_log(abs_i[ci]), min(11, (len(ci)//2)*2-1 or 5))
+        dl = np.abs(np.gradient(lc, E[ci]))
+        thr = np.percentile(dl, 20)
+        flat = dl < max(thr, 0.5)
+        runs = [(k2, list(g)) for k2, g in groupby(enumerate(flat), key=lambda x: x[1]) if k2]
         if runs:
-            best_run = max(runs, key=lambda x: len(x[1]))
-            idxs = [s[0] for s in best_run[1]]
-            e_range = abs(E[ci[idxs[-1]]] - E[ci[idxs[0]]])
-            far = abs(E[ci[idxs[0]]] - Ec) > 0.08
-            if len(idxs) >= 4 and e_range > 0.03 and far:
-                reg.update(
-                    limit_idx=ci[idxs],
-                    iL=float(np.median(abs_i[ci[idxs]])),
-                    E_lim_start=float(E[ci[idxs[0]]]),
-                    E_lim_end=float(E[ci[idxs[-1]]]),
-                )
+            br = max(runs, key=lambda x: len(x[1]))
+            idxs = [s[0] for s in br[1]]
+            er = abs(E[ci[idxs[-1]]] - E[ci[idxs[0]]])
+            far = abs(E[ci[idxs[0]]] - Ec) > 0.06
+            if len(idxs) >= 4 and er > 0.03 and far:
+                reg.update(iL=float(np.median(abs_i[ci[idxs]])),
+                           E_lim_s=float(E[ci[idxs[0]]]),
+                           E_lim_e=float(E[ci[idxs[-1]]]))
 
-    # ── Anodic: passive region + breakdown ──────────────
+    # ── Anodic analysis ─────────────────────────────────
     ai = np.where(E > Ec)[0]
-    if len(ai) >= 8:
-        log_a = smooth(safe_log10(abs_i[ai]), min(11, (len(ai)//2)*2-1 or 5))
-        dlog = np.abs(np.gradient(log_a, E[ai]))
-        threshold = np.percentile(dlog, 30)
-        flat = dlog < max(threshold, 1.0)
-        runs = [(k, list(g)) for k, g in groupby(enumerate(flat), key=lambda x: x[1]) if k]
-        if runs:
-            best_run = max(runs, key=lambda x: len(x[1]))
-            idxs = [s[0] for s in best_run[1]]
-            e_range = abs(E[ai[idxs[-1]]] - E[ai[idxs[0]]])
-            if len(idxs) >= 4 and e_range > 0.04:
-                ps, pe = ai[idxs[0]], ai[idxs[-1]]
-                i_in_region = np.median(abs_i[ps:pe+1])
-                pre_passive = np.where((E > Ec) & (E < E[ps]))[0]
-                is_passive = True
-                if len(pre_passive) > 2:
-                    i_peak = np.max(abs_i[pre_passive])
-                    is_passive = i_in_region < i_peak * 0.8
-                else:
-                    is_passive = e_range > 0.10
+    if len(ai) < 6:
+        reg["curve_type"] = CT.ACTIVE_DIFF if "iL" in reg else CT.ACTIVE
+        return reg
 
-                if is_passive:
-                    reg.update(
-                        passive_s=int(ps), passive_e=int(pe),
-                        E_ps=float(E[ps]), E_pe=float(E[pe]),
-                        ipass=float(np.median(abs_i[ps:pe+1])),
-                        Epp=float(E[ps]),
-                    )
-                    if pe + 3 < n:
-                        d_after = np.gradient(safe_log10(abs_i[pe:]), E[pe:])
-                        thr = np.mean(dlog) + 2.0 * np.std(dlog)
-                        jump = np.where(np.abs(d_after) > max(thr, 3.0))[0]
-                        if len(jump):
-                            eb_idx = pe + jump[0]
-                            reg["Eb_idx"] = int(eb_idx)
-                            reg["Eb"] = float(E[eb_idx])
-                        reg["tp_idx"] = reg.get("Eb_idx", pe)
+    log_a = smooth(safe_log(abs_i[ai]), min(15, (len(ai)//2)*2-1 or 5))
+    E_a = E[ai]
+    dlog = np.gradient(log_a, E_a)
+
+    # ── Find anodic peaks (active dissolution "nose") ───
+    # A peak in |i| on the anodic side indicates active dissolution peak
+    # Use smoothed current to find local maxima
+    i_a_smooth = smooth(abs_i[ai], min(21, (len(ai)//2)*2-1 or 5))
+    log_i_smooth = safe_log(i_a_smooth)
+
+    # Find local maxima in log|i| on anodic side
+    peaks = []
+    if len(ai) > 20:
+        order = max(3, len(ai)//20)
+        peak_idx = argrelextrema(log_i_smooth, np.greater, order=order)[0]
+        # Filter: peak must be significantly above the minimum after it
+        for pk in peak_idx:
+            # Look for a minimum after this peak
+            rest = log_i_smooth[pk:]
+            if len(rest) > 5:
+                min_after = np.min(rest[3:])
+                prominence = log_i_smooth[pk] - min_after
+                if prominence > 0.3:  # at least 0.3 decades drop
+                    peaks.append({
+                        "idx": ai[pk], "E": float(E_a[pk]),
+                        "log_i": float(log_i_smooth[pk]),
+                        "prominence": float(prominence),
+                    })
+
+    reg["anodic_peaks"] = peaks
+
+    # ── Passive region (flat sections in anodic log|i|) ──
+    abs_dlog = np.abs(dlog)
+    thr_p = np.percentile(abs_dlog, 25)
+    flat = abs_dlog < max(thr_p, 0.8)
+    runs = [(k2, list(g)) for k2, g in groupby(enumerate(flat), key=lambda x: x[1]) if k2]
+
+    passive_regions = []
+    if runs:
+        for _, run_items in runs:
+            idxs = [s[0] for s in run_items]
+            er = abs(E_a[idxs[-1]] - E_a[idxs[0]])
+            if len(idxs) >= 4 and er > 0.03:
+                ps_g, pe_g = ai[idxs[0]], ai[idxs[-1]]
+                i_med = float(np.median(abs_i[ps_g:pe_g+1]))
+                passive_regions.append({
+                    "ps": ps_g, "pe": pe_g,
+                    "E_s": float(E[ps_g]), "E_e": float(E[pe_g]),
+                    "ipass": i_med, "range": er,
+                })
+
+    # Validate passive regions: current should be lower than preceding peak
+    valid_passive = []
+    for pr in passive_regions:
+        # Check if there's a peak before this passive region
+        pre = np.where((E > Ec) & (E < pr["E_s"]))[0]
+        if len(pre) > 2:
+            i_peak = np.max(abs_i[pre])
+            if pr["ipass"] < i_peak * 0.5:
+                valid_passive.append(pr)
+        elif pr["range"] > 0.08:  # wide enough to be passive even without clear peak
+            valid_passive.append(pr)
+
+    # ── Assign primary and secondary passive regions ─────
+    if len(valid_passive) >= 1:
+        reg["pass1"] = valid_passive[0]
+        reg["Epp"] = valid_passive[0]["E_s"]
+        reg["ipass"] = valid_passive[0]["ipass"]
+
+    if len(valid_passive) >= 2:
+        reg["pass2"] = valid_passive[1]  # secondary passivity
+        reg["Esp"] = valid_passive[1]["E_s"]
+        reg["ipass2"] = valid_passive[1]["ipass"]
+
+    # ── Transpassive / breakdown ─────────────────────────
+    if "pass1" in reg:
+        pe = reg["pass1"]["pe"]
+        if pe + 5 < n:
+            d_after = np.gradient(safe_log(abs_i[pe:]), E[pe:])
+            # Sharp rise = breakdown/transpassive
+            thr_b = np.percentile(np.abs(d_after), 75)
+            jump = np.where(np.abs(d_after) > max(thr_b, 2.0))[0]
+            if len(jump):
+                eb_idx = pe + jump[0]
+                reg["Eb"] = float(E[eb_idx])
+                reg["Eb_idx"] = eb_idx
+
+                # Is it pitting (very sharp) or transpassive (gradual)?
+                if len(jump) > 3:
+                    slope_at_break = np.mean(np.abs(d_after[jump[:5]]))
+                    reg["is_pitting"] = slope_at_break > 10  # >10 dec/V = likely pitting
+                else:
+                    reg["is_pitting"] = False
 
     # ── Classify curve type ─────────────────────────────
-    has_passive = reg.get("passive_s") is not None
-    has_limiting = reg.get("iL") is not None
-    if has_passive and has_limiting:
-        reg["curve_type"] = CurveType.MIXED
-    elif has_passive:
-        reg["curve_type"] = CurveType.PASSIVE
-    elif has_limiting:
-        reg["curve_type"] = CurveType.DIFFUSION_LIMITED
-    else:
-        reg["curve_type"] = CurveType.ACTIVE_ONLY
+    has_diff = "iL" in reg
+    has_pass = "pass1" in reg
+    has_tp = "Eb" in reg
+    has_sp = "pass2" in reg
+    is_pit = reg.get("is_pitting", False)
 
+    if has_sp:
+        ct = CT.PASSIVE_TP_SP if has_tp else CT.FULL
+    elif has_tp and is_pit:
+        ct = CT.PASSIVE_PITTING
+    elif has_tp:
+        ct = CT.PASSIVE_TP if not has_diff else CT.FULL
+    elif has_pass:
+        ct = CT.PASSIVE_DIFF if has_diff else CT.PASSIVE
+    elif has_diff:
+        ct = CT.ACTIVE_DIFF
+    else:
+        ct = CT.ACTIVE
+
+    reg["curve_type"] = ct
     return reg
 
 
 # ═══════════════════════════════════════════════════════════════
-# GLOBAL FITTING ENGINE
+# INITIAL GUESS BUILDER
 # ═══════════════════════════════════════════════════════════════
 
-class GlobalFitter:
-    """
-    Two-stage fitting:
-      1. Local analysis → extract initial parameter guesses
-      2. Global model fit across ENTIRE curve with multi-strategy optimization
-    """
+def build_initial_guess(E, i, reg):
+    """Extract initial parameter guesses from local analysis."""
+    Ec = reg["Ecorr"]
+    abs_i = np.abs(i)
+    ct = reg["curve_type"]
+    log_abs = safe_log(i)
 
-    def __init__(self, E, i, reg):
+    # ── Local Tafel slopes ──────────────────────────────
+    ba0, bc0, icorr0 = 0.060, 0.120, max(abs_i[reg["ecorr_idx"]], 1e-10)
+
+    # Anodic Tafel window search
+    Epp = reg.get("Epp", Ec + 0.50)
+    E_limit = min(Epp - 0.005, Ec + 0.25)
+    best_an = None
+    for lo in np.arange(0.005, 0.05, 0.005):
+        for hi in np.arange(lo+0.015, min(lo+0.18, E_limit-Ec), 0.005):
+            m = (E > Ec+lo) & (E < Ec+hi)
+            if m.sum() < 4: continue
+            s, b, r, *_ = linregress(E[m], log_abs[m])
+            if s > 0 and 20 < (1/s)*1000 < 500 and r**2 > 0.88:
+                if best_an is None or r**2 > best_an[2]:
+                    best_an = (1/s, b, r**2, s)
+    if best_an:
+        ba0 = best_an[0]
+
+    # Cathodic Tafel window search
+    E_lim = reg.get("E_lim_e")
+    best_ca = None
+    for lo in np.arange(0.005, 0.08, 0.005):
+        for hi in np.arange(lo+0.015, lo+0.25, 0.005):
+            m = (E < Ec-lo) & (E > Ec-hi)
+            if E_lim is not None: m = m & (E > E_lim + 0.005)
+            if m.sum() < 4: continue
+            s, b, r, *_ = linregress(E[m], log_abs[m])
+            if s < 0 and 20 < (-1/s)*1000 < 500 and r**2 > 0.88:
+                if best_ca is None or r**2 > best_ca[2]:
+                    best_ca = (-1/s, b, r**2, s)
+    if best_ca:
+        bc0 = best_ca[0]
+
+    # Refine icorr from Tafel intersection
+    if best_an and best_ca:
+        ds = best_an[3] - best_ca[3]
+        if abs(ds) > 1e-10:
+            Ei = (best_ca[1] - best_an[1]) / ds  # b_ca - b_an on y = s*E + b
+            # Actually: best_an = (ba, intercept_an, r2, slope_an), best_ca = (bc, intercept_ca, r2, slope_ca)
+            Ei = (best_ca[1] - best_an[1]) / (best_an[3] - best_ca[3])
+            li = best_an[3] * Ei + best_an[1]
+            icorr0 = 10**li
+
+    # ── Build p0 array [14 params] ──────────────────────
+    iL0 = reg.get("iL", 1e2)
+    Epp0 = reg.get("Epp", Ec + 0.30)
+    ipass0 = reg.get("ipass", 1e1)
+    k_pass0 = 40.0  # ~25mV transition width
+
+    Eb0 = reg.get("Eb", E[-1])
+    a_tp0 = ipass0 if reg.get("Eb") else 1e-12
+    b_tp0 = 8.0
+
+    Esp0 = reg.get("Esp", E[-1] + 0.5)
+    ipass2_0 = reg.get("ipass2", ipass0)
+    k_sp0 = 30.0
+
+    # Estimate transpassive params from data after Eb
+    if reg.get("Eb") and not reg.get("pass2"):
+        tp_mask = E > reg["Eb"]
+        if tp_mask.sum() > 5:
+            try:
+                s, inter, *_ = linregress(E[tp_mask], safe_log(abs_i[tp_mask]))
+                b_tp0 = max(abs(s) * 2.303, 1.0)
+                a_tp0 = max(10**(inter - b_tp0/2.303 * reg["Eb"]), 1e-12)
+            except: pass
+
+    # For active-only systems, disable unused components
+    if ct == CT.ACTIVE:
+        k_pass0 = 0.01; ipass0 = 1e3; iL0 = 1e3
+        a_tp0 = 1e-15; k_sp0 = 0.01; ipass2_0 = 1e3
+    elif ct == CT.ACTIVE_DIFF:
+        k_pass0 = 0.01; ipass0 = 1e3
+        a_tp0 = 1e-15; k_sp0 = 0.01; ipass2_0 = 1e3
+
+    p0 = np.array([Ec, icorr0, ba0, bc0, iL0,
+                    Epp0, k_pass0, ipass0,
+                    Eb0, a_tp0, b_tp0,
+                    Esp0, k_sp0, ipass2_0])
+    return p0
+
+
+def build_bounds(E, i, reg, p0):
+    """Build bounds for each parameter based on curve type."""
+    ct = reg["curve_type"]
+    Ec = p0[0]; ic = p0[1]
+    has_pass = ct not in (CT.ACTIVE, CT.ACTIVE_DIFF)
+    has_diff = "iL" in reg
+    has_tp = "Eb" in reg
+    has_sp = "pass2" in reg
+
+    lo = [
+        Ec - 0.15,                                          # Ecorr
+        max(ic * 1e-4, 1e-14),                              # icorr
+        0.010,                                               # ba
+        0.010,                                               # bc
+        reg.get("iL", 1e-4)*0.01 if has_diff else 1e0,     # iL
+        p0[5] - 0.15 if has_pass else E[-1] - 0.1,         # Epp
+        5.0 if has_pass else 0.001,                          # k_pass
+        max(p0[7]*0.01, 1e-10) if has_pass else 1e0,        # ipass
+        p0[8] - 0.20 if has_tp else E[-1] - 0.1,            # Eb
+        max(p0[9]*1e-4, 1e-15),                              # a_tp
+        0.5,                                                  # b_tp
+        p0[11] - 0.20 if has_sp else E[-1],                  # Esp
+        5.0 if has_sp else 0.001,                             # k_sp
+        max(p0[13]*0.01, 1e-10) if has_sp else 1e0,          # ipass2
+    ]
+    hi = [
+        Ec + 0.15,
+        min(ic * 1e4, 1e0),
+        0.500,
+        0.500,
+        reg.get("iL", 1e0)*100 if has_diff else 1e5,
+        p0[5] + 0.15 if has_pass else E[-1] + 0.5,
+        200.0 if has_pass else 1.0,
+        p0[7]*100 if has_pass else 1e5,
+        p0[8] + 0.20 if has_tp else E[-1] + 0.5,
+        max(p0[9]*1e4, 1e-2),
+        40.0,
+        p0[11] + 0.20 if has_sp else E[-1] + 1.0,
+        200.0 if has_sp else 1.0,
+        p0[13]*100 if has_sp else 1e5,
+    ]
+    # Ensure lo < hi
+    for idx in range(len(lo)):
+        if lo[idx] >= hi[idx]:
+            mid = (lo[idx] + hi[idx]) / 2
+            lo[idx] = mid - abs(mid)*0.5 - 1e-6
+            hi[idx] = mid + abs(mid)*0.5 + 1e-6
+    return lo, hi
+
+
+# ═══════════════════════════════════════════════════════════════
+# OPTIMIZATION ENGINE
+# ═══════════════════════════════════════════════════════════════
+
+def _objective_log(p, E, log_data):
+    """Log-space objective (main): treats all decades equally."""
+    try:
+        pred = global_model(E, p)
+        log_pred = safe_log(pred)
+        return float(np.sum((log_data - log_pred)**2))
+    except:
+        return 1e30
+
+
+def _objective_combined(p, E, i_data, log_data):
+    """Combined objective: log-space + weighted linear."""
+    try:
+        pred = global_model(E, p)
+        log_pred = safe_log(pred)
+        res_log = np.sum((log_data - log_pred)**2)
+        res_rel = np.sum(((i_data - pred) / (np.abs(i_data) + 1e-12))**2) * 0.03
+        return float(res_log + res_rel)
+    except:
+        return 1e30
+
+
+class Optimizer:
+    """Multi-stage global optimization engine."""
+
+    def __init__(self, E, i, reg, p0, progress_callback=None):
         self.E = E
         self.i = i
-        self.abs_i = np.abs(i)
-        self.log_abs_i = safe_log10(i)
+        self.log_data = safe_log(i)
         self.reg = reg
-        self.Ec = reg["Ecorr"]
-        self.ec_idx = reg["ecorr_idx"]
-        self.ic0 = max(float(np.abs(i[self.ec_idx])), 1e-12)
-        self.curve_type = reg["curve_type"]
-        self.R = {}
+        self.p0 = p0
+        self.lo, self.hi = build_bounds(E, i, reg, p0)
         self.log = []
+        self.best_p = None
+        self.best_score = 1e30
+        self.progress = progress_callback
 
-    # ── Stage 1: Local Tafel analysis for initial guesses ─
-
-    def _find_tafel_window(self, side="anodic"):
-        E, log_i, Ec = self.E, self.log_abs_i, self.Ec
-        if side == "anodic":
-            E_limit = self.reg.get("E_ps", Ec + 0.50)
-            E_limit = min(E_limit - 0.005, Ec + 0.30)
-            best = None
-            for lo in np.arange(0.005, 0.06, 0.005):
-                for hi in np.arange(lo + 0.015, min(lo + 0.20, E_limit - Ec), 0.005):
-                    m = (E > Ec + lo) & (E < Ec + hi)
-                    if m.sum() < 4: continue
-                    s, b, r, *_ = linregress(E[m], log_i[m])
-                    if s <= 0: continue
-                    ba_mV = (1/s) * 1000
-                    if 20 < ba_mV < 500 and r**2 > 0.90:
-                        if best is None or r**2 > best["r2"]:
-                            best = dict(slope=s, intercept=b, r2=r**2, ba=1/s,
-                                        mask=m, lo=lo, hi=hi, n=int(m.sum()))
-            return best
+    def _update_best(self, p, tag=""):
+        score = _objective_log(p, self.E, self.log_data)
+        r2 = _r2(self.log_data, safe_log(global_model(self.E, p)))
+        if score < self.best_score:
+            self.best_p = p.copy()
+            self.best_score = score
+            self.log.append(f"✅ {tag}: R²(log) = {r2:.6f}")
         else:
-            E_lim_end = self.reg.get("E_lim_end")
-            best = None
-            for lo in np.arange(0.005, 0.10, 0.005):
-                for hi in np.arange(lo + 0.015, lo + 0.30, 0.005):
-                    m = (E < Ec - lo) & (E > Ec - hi)
-                    if E_lim_end is not None:
-                        m = m & (E > E_lim_end + 0.005)
-                    if m.sum() < 4: continue
-                    s, b, r, *_ = linregress(E[m], log_i[m])
-                    if s >= 0: continue
-                    bc_mV = (-1/s) * 1000
-                    if 20 < bc_mV < 500 and r**2 > 0.90:
-                        if best is None or r**2 > best["r2"]:
-                            best = dict(slope=s, intercept=b, r2=r**2, bc=-1/s,
-                                        mask=m, lo=lo, hi=hi, n=int(m.sum()))
-            return best
+            self.log.append(f"ℹ️ {tag}: R²(log) = {r2:.6f} (no improvement)")
+        return r2
 
-    def _local_analysis(self):
-        """Extract initial guesses from Tafel slopes and region detection."""
-        an = self._find_tafel_window("anodic")
-        ca = self._find_tafel_window("cathodic")
+    def _make_de_bounds(self):
+        """Convert to log-space bounds for better DE exploration."""
+        # Work in log-space for current-like parameters
+        b = []
+        for idx in range(N_PARAMS):
+            if idx in (1, 4, 7, 9, 13):  # icorr, iL, ipass, a_tp, ipass2
+                b.append((np.log10(max(self.lo[idx], 1e-15)),
+                          np.log10(max(self.hi[idx], 1e-14))))
+            else:
+                b.append((self.lo[idx], self.hi[idx]))
+        return b
 
-        if an:
-            self.R["an"] = an
-            self.log.append(
-                f"✅ Anodic Tafel: βa = {an['ba']*1000:.1f} mV/dec, "
-                f"R² = {an['r2']:.4f}")
-        else:
-            self.log.append("ℹ️ No clean anodic Tafel region — using default βa guess.")
+    def _de_to_real(self, x):
+        """Convert DE log-space params back to real."""
+        p = x.copy()
+        for idx in (1, 4, 7, 9, 13):
+            p[idx] = 10**x[idx]
+        return p
 
-        if ca:
-            self.R["ca"] = ca
-            self.log.append(
-                f"✅ Cathodic Tafel: βc = {ca['bc']*1000:.1f} mV/dec, "
-                f"R² = {ca['r2']:.4f}")
-        else:
-            self.log.append("ℹ️ No clean cathodic Tafel region — using default βc guess.")
+    def _real_to_de(self, p):
+        """Convert real params to DE log-space."""
+        x = p.copy()
+        for idx in (1, 4, 7, 9, 13):
+            x[idx] = np.log10(max(p[idx], 1e-15))
+        return x
 
-        # Intersection icorr
-        if an and ca:
-            ds = an["slope"] - ca["slope"]
-            if abs(ds) > 1e-10:
-                E_i = (ca["intercept"] - an["intercept"]) / ds
-                logi = an["slope"] * E_i + an["intercept"]
-                self.R["Ecorr_tafel"] = float(E_i)
-                self.R["icorr_tafel"] = float(10**logi)
-                self.log.append(
-                    f"✅ Tafel intersection: Ecorr = {E_i:.4f} V, "
-                    f"icorr = {10**logi:.3e} A/cm²")
+    def run_de(self, maxiter=4000, popsize=40):
+        """Stage 1: Differential Evolution (global search)."""
+        self.log.append("🔧 **Stage 1: Differential Evolution** (global search)")
+        bounds = self._make_de_bounds()
+        E, ld = self.E, self.log_data
 
-        # Local BV fit (narrow window) for refined Ecorr/icorr
-        ba0 = an["ba"] if an else 0.06
-        bc0 = ca["bc"] if ca else 0.12
-        Eps = self.reg.get("E_ps")
-        hw_an = min(0.15, (Eps - self.Ec) * 0.7) if Eps else 0.15
-        hw_cat = 0.15
-        m = (self.E > self.Ec - hw_cat) & (self.E < self.Ec + hw_an)
-        if m.sum() >= 6:
-            try:
-                p0 = [self.Ec, self.ic0, ba0, bc0]
-                bnd = ([self.E.min(), 1e-14, 0.005, 0.005],
-                       [self.E.max(), 1e-1, 0.8, 0.8])
-                popt, _ = curve_fit(butler_volmer, self.E[m], self.i[m], p0=p0,
-                                    bounds=bnd, maxfev=50000, method="trf",
-                                    ftol=1e-14, xtol=1e-14)
-                self.R["local_bv"] = dict(Ecorr=float(popt[0]), icorr=float(popt[1]),
-                                          ba=float(popt[2]), bc=float(popt[3]))
-                self.log.append(
-                    f"✅ Local BV: Ecorr = {popt[0]:.4f}, icorr = {popt[1]:.3e}, "
-                    f"βa = {popt[2]*1000:.0f}, βc = {popt[3]*1000:.0f} mV/dec")
-            except:
-                pass
-
-    def _build_initial_guess(self):
-        """Build p0 and bounds for the global model from local analysis."""
-        reg = self.reg
-        ct = self.curve_type
-
-        # Best estimates from local fits
-        lbv = self.R.get("local_bv", {})
-        an = self.R.get("an", {})
-        ca = self.R.get("ca", {})
-
-        Ecorr0 = lbv.get("Ecorr") or self.R.get("Ecorr_tafel") or self.Ec
-        icorr0 = lbv.get("icorr") or self.R.get("icorr_tafel") or self.ic0
-        ba0 = lbv.get("ba") or an.get("ba") or 0.060
-        bc0 = lbv.get("bc") or ca.get("bc") or 0.120
-
-        # Passive current density
-        ipass0 = reg.get("ipass", 1e0)  # very large = no passivation
-        if ct == CurveType.ACTIVE_ONLY:
-            ipass0 = 1e2  # effectively infinite
-
-        # Limiting current
-        iL0 = reg.get("iL", 1e2)  # very large = no diffusion limitation
-        if ct == CurveType.ACTIVE_ONLY:
-            iL0 = 1e2
-
-        # Breakdown / transpassive
-        Eb0 = reg.get("Eb") or reg.get("E_pe") or self.E[-1]
-        # Transpassive parameters: estimate from slope after Eb
-        a_tp0 = ipass0 if reg.get("Eb") else 1e-10
-        b_tp0 = 5.0  # moderate exponential rise
-
-        # If we have data past Eb, estimate transpassive parameters
-        if reg.get("Eb"):
-            tp_mask = self.E > reg["Eb"]
-            if tp_mask.sum() > 3:
-                log_tp = safe_log10(self.abs_i[tp_mask])
-                E_tp = self.E[tp_mask]
-                try:
-                    s, intercept, *_ = linregress(E_tp, log_tp)
-                    b_tp0 = max(s * 2.303, 1.0)  # convert to natural
-                    a_tp0 = 10**intercept / np.exp(b_tp0 * (E_tp[0] - reg["Eb"]))
-                    a_tp0 = max(a_tp0, 1e-10)
-                except:
-                    pass
-
-        self._p0 = {
-            "Ecorr": Ecorr0, "icorr": icorr0, "ba": ba0, "bc": bc0,
-            "ipass": ipass0, "iL": iL0, "Eb": Eb0, "a_tp": a_tp0, "b_tp": b_tp0,
-        }
-
-        self.log.append(
-            f"   Initial guess: Ecorr={Ecorr0:.4f}, icorr={icorr0:.2e}, "
-            f"βa={ba0*1000:.0f}, βc={bc0*1000:.0f} mV/dec")
-        if ct in (CurveType.PASSIVE, CurveType.MIXED):
-            self.log.append(f"   ipass={ipass0:.2e}, Eb={Eb0:.3f}")
-        if ct in (CurveType.DIFFUSION_LIMITED, CurveType.MIXED):
-            self.log.append(f"   iL={iL0:.2e}")
-
-    # ── Stage 2: Global model fitting ─────────────────────
-
-    def _global_fit_de(self):
-        """Differential Evolution global optimization of the full model."""
-        E, i = self.E, self.i
-        p = self._p0
-        ct = self.curve_type
-        log_abs_data = safe_log10(i)
-
-        # Build DE bounds based on curve type
-        Ec = p["Ecorr"]
-        ic = p["icorr"]
-
-        bounds = [
-            (Ec - 0.10, Ec + 0.10),                              # Ecorr
-            (np.log10(max(ic*1e-3, 1e-14)), np.log10(ic*1e3)),   # log10(icorr)
-            (0.010, 0.500),                                       # ba
-            (0.010, 0.500),                                       # bc
-        ]
-
-        # ipass bounds
-        if ct in (CurveType.PASSIVE, CurveType.MIXED):
-            ip = p["ipass"]
-            bounds.append((np.log10(max(ip*0.01, 1e-10)), np.log10(ip*100)))
-        else:
-            bounds.append((0.0, 5.0))  # effectively infinite
-
-        # iL bounds
-        if ct in (CurveType.DIFFUSION_LIMITED, CurveType.MIXED):
-            il = p["iL"]
-            bounds.append((np.log10(max(il*0.01, 1e-8)), np.log10(il*100)))
-        else:
-            bounds.append((0.0, 5.0))  # effectively infinite
-
-        # Eb, a_tp, b_tp bounds
-        if ct in (CurveType.PASSIVE, CurveType.MIXED):
-            Eb = p["Eb"]
-            bounds.append((Eb - 0.15, min(Eb + 0.15, E[-1])))        # Eb
-            bounds.append((np.log10(max(p["a_tp"]*0.001, 1e-12)),
-                           np.log10(max(p["a_tp"]*1000, 1e-2))))      # log10(a_tp)
-            bounds.append((0.5, 30.0))                                 # b_tp
-        else:
-            bounds.append((E[-1] - 0.1, E[-1] + 0.5))   # Eb far away
-            bounds.append((-12.0, -8.0))                  # tiny a_tp
-            bounds.append((0.5, 5.0))                     # b_tp irrelevant
-
-        def objective(x):
-            try:
-                pred = global_model(E, x[0], 10**x[1], x[2], x[3],
-                                    10**x[4], 10**x[5], x[6], 10**x[7], x[8])
-                log_pred = safe_log10(pred)
-                # Primary: log-space residual (weighs all decades equally)
-                res_log = np.sum((log_abs_data - log_pred)**2)
-                # Secondary: relative residual in linear space (helps near Ecorr)
-                res_rel = np.sum(((i - pred) / (np.abs(i) + 1e-12))**2) * 0.05
-                return res_log + res_rel
-            except:
-                return 1e30
-
-        self.log.append("🔧 Running Differential Evolution global optimization…")
+        def obj(x):
+            p = self._de_to_real(x)
+            return _objective_combined(p, E, self.i, ld)
 
         try:
-            result = differential_evolution(
-                objective, bounds, seed=42,
-                maxiter=4000, tol=1e-13,
-                popsize=35, workers=1,
-                mutation=(0.5, 1.5), recombination=0.9,
-                polish=False  # we'll do our own polishing
-            )
-            x = result.x
-            params = dict(
-                Ecorr=float(x[0]), icorr=float(10**x[1]),
-                ba=float(x[2]), bc=float(x[3]),
-                ipass=float(10**x[4]), iL=float(10**x[5]),
-                Eb=float(x[6]), a_tp=float(10**x[7]), b_tp=float(x[8]),
-            )
-            pred = global_model(E, params["Ecorr"], params["icorr"],
-                                params["ba"], params["bc"],
-                                params["ipass"], params["iL"],
-                                params["Eb"], params["a_tp"], params["b_tp"])
-            r2_log = _r2(log_abs_data, safe_log10(pred))
-            r2_lin = _r2(i, pred)
-            params.update(r2_log=r2_log, r2_lin=r2_lin,
-                          method="Global DE", success=True)
-
-            self.log.append(
-                f"✅ DE result: R²(log) = {r2_log:.4f}, R²(lin) = {r2_lin:.4f}")
-
-            self.R["global_de"] = params
-            self._de_x = x  # save for polishing
-            return params
+            t0 = time.time()
+            res = differential_evolution(
+                obj, bounds, seed=42, maxiter=maxiter, tol=1e-13,
+                popsize=popsize, workers=1,
+                mutation=(0.5, 1.8), recombination=0.9, polish=False)
+            p = self._de_to_real(res.x)
+            self._update_best(p, f"DE ({time.time()-t0:.1f}s, {res.nit} iter)")
         except Exception as ex:
             self.log.append(f"⚠️ DE failed: {ex}")
-            return None
 
-    def _polish_nelder_mead(self, x0_dict):
-        """Nelder-Mead polish of the DE result."""
-        E, i = self.E, self.i
-        log_abs_data = safe_log10(i)
+    def run_dual_annealing(self, maxiter=2000):
+        """Stage 2: Dual Annealing (escape local minima)."""
+        self.log.append("🔧 **Stage 2: Dual Annealing** (escape local minima)")
+        bounds = self._make_de_bounds()
+        E, ld = self.E, self.log_data
+        x0 = self._real_to_de(self.best_p) if self.best_p is not None else self._real_to_de(self.p0)
 
-        x0 = [
-            x0_dict["Ecorr"], np.log10(max(x0_dict["icorr"], 1e-14)),
-            x0_dict["ba"], x0_dict["bc"],
-            np.log10(max(x0_dict["ipass"], 1e-14)),
-            np.log10(max(x0_dict["iL"], 1e-14)),
-            x0_dict["Eb"],
-            np.log10(max(x0_dict["a_tp"], 1e-14)),
-            x0_dict["b_tp"],
-        ]
-
-        def objective(x):
-            try:
-                pred = global_model(E, x[0], 10**x[1], x[2], x[3],
-                                    10**x[4], 10**x[5], x[6], 10**x[7], x[8])
-                log_pred = safe_log10(pred)
-                return float(np.sum((log_abs_data - log_pred)**2))
-            except:
-                return 1e30
+        def obj(x):
+            return _objective_log(self._de_to_real(x), E, ld)
 
         try:
-            res = minimize(objective, x0, method="Nelder-Mead",
-                          options={"maxiter": 50000, "xatol": 1e-13, "fatol": 1e-15,
-                                   "adaptive": True})
-            x = res.x
-            params = dict(
-                Ecorr=float(x[0]), icorr=float(10**x[1]),
-                ba=float(x[2]), bc=float(x[3]),
-                ipass=float(10**x[4]), iL=float(10**x[5]),
-                Eb=float(x[6]), a_tp=float(10**x[7]), b_tp=float(x[8]),
-            )
-            pred = global_model(E, *[params[k] for k in
-                                     ["Ecorr","icorr","ba","bc","ipass","iL","Eb","a_tp","b_tp"]])
-            r2_log = _r2(log_abs_data, safe_log10(pred))
-            r2_lin = _r2(i, pred)
-            params.update(r2_log=r2_log, r2_lin=r2_lin,
-                          method="Global DE + NM polished", success=True)
-            self.log.append(f"✅ NM polish: R²(log) = {r2_log:.4f}")
-            return params
+            t0 = time.time()
+            res = dual_annealing(
+                obj, bounds, x0=x0, maxiter=maxiter, seed=42,
+                initial_temp=5230, visit=2.62, restart_temp_ratio=2e-5)
+            p = self._de_to_real(res.x)
+            self._update_best(p, f"Dual Annealing ({time.time()-t0:.1f}s)")
         except Exception as ex:
-            self.log.append(f"⚠️ NM polish failed: {ex}")
-            return x0_dict
+            self.log.append(f"⚠️ Dual Annealing failed: {ex}")
 
-    def _try_curve_fit_refinement(self, x0_dict):
-        """Try scipy curve_fit for final refinement (gradient-based)."""
-        E, i = self.E, self.i
-        log_abs_data = safe_log10(i)
-
-        p0 = [x0_dict["Ecorr"], x0_dict["icorr"], x0_dict["ba"], x0_dict["bc"],
-              x0_dict["ipass"], x0_dict["iL"], x0_dict["Eb"],
-              x0_dict["a_tp"], x0_dict["b_tp"]]
-
-        # Wide but sensible bounds
-        bnd_lo = [E.min(), 1e-14, 0.005, 0.005, 1e-10, 1e-8,
-                  E.min(), 1e-14, 0.1]
-        bnd_hi = [E.max(), 1e0, 0.8, 0.8, 1e2, 1e2,
-                  E.max() + 0.5, 1e2, 50.0]
+    def run_lbfgsb(self):
+        """Stage 3: L-BFGS-B gradient refinement."""
+        self.log.append("🔧 **Stage 3: L-BFGS-B** (gradient refinement)")
+        if self.best_p is None: return
+        bounds = list(zip(self.lo, self.hi))
+        E, ld = self.E, self.log_data
 
         try:
-            popt, _ = curve_fit(global_model, E, i, p0=p0,
-                                bounds=(bnd_lo, bnd_hi),
-                                maxfev=100000, method="trf",
-                                ftol=1e-15, xtol=1e-15)
-            params = dict(zip(
-                ["Ecorr","icorr","ba","bc","ipass","iL","Eb","a_tp","b_tp"],
-                [float(v) for v in popt]))
-            pred = global_model(E, *popt)
-            r2_log = _r2(log_abs_data, safe_log10(pred))
-            r2_lin = _r2(i, pred)
-            params.update(r2_log=r2_log, r2_lin=r2_lin,
-                          method="Global TRF refined", success=True)
-            self.log.append(f"✅ TRF refinement: R²(log) = {r2_log:.4f}")
-            return params
+            t0 = time.time()
+            res = minimize(lambda p: _objective_log(p, E, ld), self.best_p,
+                          method="L-BFGS-B", bounds=bounds,
+                          options={"maxiter": 30000, "ftol": 1e-15, "gtol": 1e-12})
+            self._update_best(res.x, f"L-BFGS-B ({time.time()-t0:.1f}s)")
         except Exception as ex:
-            self.log.append(f"ℹ️ TRF refinement did not improve: {ex}")
-            return None
+            self.log.append(f"ℹ️ L-BFGS-B: {ex}")
 
-    # ── Polarization resistance ───────────────────────────
+    def run_nelder_mead(self):
+        """Stage 4: Nelder-Mead (derivative-free polish)."""
+        self.log.append("🔧 **Stage 4: Nelder-Mead** (final polish)")
+        if self.best_p is None: return
+        x0 = self._real_to_de(self.best_p)
+        E, ld = self.E, self.log_data
 
-    def _fit_rp(self):
-        E, i, Ec = self.E, self.i, self.Ec
-        for dE in [0.010, 0.015, 0.025, 0.05]:
-            m = np.abs(E - Ec) < dE
-            if m.sum() >= 4:
-                s, _, r, *_ = linregress(E[m], i[m])
-                if abs(s) > 1e-20:
-                    self.R["rp"] = dict(Rp=float(1/s), r2=float(r**2), dE=dE)
-                    self.log.append(f"✅ Rp = {1/s:.3e} Ω·cm² (±{dE*1000:.0f} mV)")
-                    return
+        try:
+            t0 = time.time()
+            res = minimize(lambda x: _objective_log(self._de_to_real(x), E, ld), x0,
+                          method="Nelder-Mead",
+                          options={"maxiter": 100000, "xatol": 1e-14,
+                                   "fatol": 1e-16, "adaptive": True})
+            p = self._de_to_real(res.x)
+            self._update_best(p, f"Nelder-Mead ({time.time()-t0:.1f}s)")
+        except Exception as ex:
+            self.log.append(f"ℹ️ NM: {ex}")
 
-    # ── Master run ────────────────────────────────────────
+    def run_all(self):
+        """Run full optimization pipeline."""
+        self.best_p = self.p0.copy()
+        self.best_score = _objective_log(self.p0, self.E, self.log_data)
 
-    def run(self):
-        ct = self.curve_type
-        self.log.append(f"🔍 Curve type: **{CurveType.DESCRIPTIONS[ct][0]}**")
-        self.log.append(f"   {CurveType.DESCRIPTIONS[ct][1]}")
-        self.log.append("─" * 50)
+        self.run_de()
+        self.run_dual_annealing()
+        self.run_lbfgsb()
+        self.run_nelder_mead()
 
-        # Stage 1: Local analysis for initial guesses
-        self.log.append("**Stage 1: Local Tafel analysis (initial guesses)**")
-        self._local_analysis()
-        self._build_initial_guess()
-
-        self.log.append("─" * 50)
-        self.log.append("**Stage 2: Global model fitting (full curve)**")
-
-        # Stage 2: Global DE
-        de_result = self._global_fit_de()
-
-        # Stage 3: Polish
-        best = de_result
-        if de_result:
-            polished = self._polish_nelder_mead(de_result)
-            if polished.get("r2_log", 0) >= de_result.get("r2_log", 0):
-                best = polished
-
-            # Try TRF refinement
-            trf = self._try_curve_fit_refinement(best)
-            if trf and trf.get("r2_log", 0) >= best.get("r2_log", 0):
-                best = trf
-
-        if best:
-            # Compute Stern-Geary
-            ba, bc = best["ba"], best["bc"]
-            if ba > 0 and bc > 0:
-                best["B"] = (ba * bc) / (2.303 * (ba + bc))
-            self.R["best"] = best
-        else:
-            # Fallback to Tafel extrapolation
-            an = self.R.get("an", {})
-            ca = self.R.get("ca", {})
-            self.R["best"] = dict(
-                Ecorr=self.R.get("Ecorr_tafel", self.Ec),
-                icorr=self.R.get("icorr_tafel", self.ic0),
-                ba=an.get("ba"), bc=ca.get("bc"),
-                method="Tafel Extrapolation only", success=False)
-
-        # Rp
-        self._fit_rp()
-
-        # Passive parameters from region detection (for display)
-        reg = self.reg
-        if reg.get("passive_s") is not None:
-            ps, pe = reg["passive_s"], reg["passive_e"]
-            self.R["passive"] = dict(
-                ipass=float(np.median(self.abs_i[ps:pe+1])),
-                E_start=float(self.E[ps]), E_end=float(self.E[pe]),
-                range_V=float(self.E[pe] - self.E[ps]))
-
-        # Quality summary
-        self.log.append("─" * 50)
-        r2l = best.get("r2_log") if best else None
-        if r2l is not None:
-            if r2l >= 0.990:
-                self.log.append(f"🎯 **Excellent global fit** — R²(log) = {r2l:.4f}")
-            elif r2l >= 0.950:
-                self.log.append(f"✅ **Good global fit** — R²(log) = {r2l:.4f}")
-            elif r2l >= 0.85:
-                self.log.append(f"⚠️ **Acceptable fit** — R²(log) = {r2l:.4f}")
+        if self.best_p is not None:
+            r2 = _r2(self.log_data, safe_log(global_model(self.E, self.best_p)))
+            self.log.append("─" * 50)
+            if r2 >= 0.995:
+                self.log.append(f"🎯 **Excellent global fit** — R²(log) = {r2:.6f}")
+            elif r2 >= 0.970:
+                self.log.append(f"✅ **Good global fit** — R²(log) = {r2:.6f}")
+            elif r2 >= 0.90:
+                self.log.append(f"⚠️ **Acceptable fit** — R²(log) = {r2:.6f}")
             else:
-                self.log.append(f"❌ **Poor fit** — R²(log) = {r2l:.4f}")
+                self.log.append(f"❌ **Poor fit** — R²(log) = {r2:.6f}")
 
-        return self.R
+        return self.best_p
+
+
+# ═══════════════════════════════════════════════════════════════
+# DATA QUALITY DIAGNOSTICS
+# ═══════════════════════════════════════════════════════════════
+
+def diagnose_data(E, i, reg, best_p, r2_log):
+    """Analyze data quality and explain discrepancies."""
+    issues = []
+    abs_i = np.abs(i)
+    log_i = safe_log(i)
+    n = len(E)
+
+    # 1. Noise level assessment
+    if n > 20:
+        log_sm = smooth(log_i, min(21, (n//4)*2-1 or 5))
+        noise = np.std(log_i - log_sm)
+        if noise > 0.5:
+            issues.append(("🔴 High noise", f"Noise σ = {noise:.2f} decades. "
+                          "Data is very noisy — consider using slower scan rate or "
+                          "averaging multiple scans. High noise degrades fit quality."))
+        elif noise > 0.15:
+            issues.append(("🟡 Moderate noise", f"Noise σ = {noise:.2f} decades. "
+                          "Acceptable but could be improved with slower scan rate."))
+        else:
+            issues.append(("🟢 Low noise", f"Noise σ = {noise:.3f} decades. Excellent signal quality."))
+
+    # 2. Scan rate / IR drop check
+    # Large Tafel slopes (>200 mV/dec) can indicate IR drop
+    if best_p is not None:
+        ba_mV = best_p[2] * 1000
+        bc_mV = best_p[3] * 1000
+        if ba_mV > 200:
+            issues.append(("🟡 Large anodic Tafel slope",
+                          f"βa = {ba_mV:.0f} mV/dec is unusually high. Possible causes: "
+                          "uncompensated IR drop, multi-step reaction mechanism, "
+                          "or mixed potential effects. Consider IR compensation."))
+        if bc_mV > 200:
+            issues.append(("🟡 Large cathodic Tafel slope",
+                          f"βc = {bc_mV:.0f} mV/dec is unusually high. "
+                          "May indicate diffusion contribution in Tafel region, "
+                          "IR drop, or reaction involving multiple electrons."))
+
+    # 3. Data range assessment
+    E_range = E[-1] - E[0]
+    if E_range < 0.3:
+        issues.append(("🟡 Narrow potential range",
+                      f"Only {E_range*1000:.0f} mV scanned. May not capture all "
+                      "regions (passive, transpassive). Consider wider scan."))
+
+    # 4. Data density
+    pts_per_V = n / max(E_range, 0.01)
+    if pts_per_V < 50:
+        issues.append(("🟡 Low data density",
+                      f"{pts_per_V:.0f} points/V. Denser sampling improves "
+                      "Tafel region identification. Use ≥100 pts/V."))
+
+    # 5. Ecorr region quality
+    ec = reg["Ecorr"]
+    near_ec = np.abs(E - ec) < 0.05
+    if near_ec.sum() < 5:
+        issues.append(("🟡 Sparse data near Ecorr",
+                      f"Only {near_ec.sum()} points within ±50 mV of Ecorr. "
+                      "Denser sampling near Ecorr improves icorr accuracy."))
+
+    # 6. Asymmetry check
+    cat_range = ec - E[0]
+    an_range = E[-1] - ec
+    if cat_range > 0 and an_range > 0:
+        ratio = an_range / cat_range
+        if ratio > 3 or ratio < 0.33:
+            issues.append(("🟡 Asymmetric scan range",
+                          f"Cathodic: {cat_range*1000:.0f} mV, Anodic: {an_range*1000:.0f} mV. "
+                          "Highly asymmetric — one branch may be poorly characterized."))
+
+    # 7. Residual pattern analysis (systematic errors)
+    if best_p is not None:
+        pred = global_model(E, best_p)
+        residuals = log_i - safe_log(pred)
+        # Check for systematic patterns (autocorrelation)
+        if len(residuals) > 10:
+            # Run-length test: too many same-sign runs → systematic misfit
+            signs = np.sign(residuals)
+            n_runs = np.sum(np.abs(np.diff(signs)) > 0) + 1
+            expected_runs = n / 2
+            if n_runs < expected_runs * 0.5:
+                issues.append(("🟡 Systematic residual pattern",
+                              f"Only {n_runs} sign changes in residuals (expected ~{expected_runs:.0f}). "
+                              "Indicates model may be missing a physical feature in the data "
+                              "(e.g., an additional reaction, adsorption peak, or "
+                              "intermediate passivation). Inspect the residual plot."))
+
+            # Check for large residuals in specific regions
+            for region_name, mask_fn in [
+                ("near Ecorr", lambda: np.abs(E - ec) < 0.05),
+                ("cathodic", lambda: E < ec - 0.1),
+                ("passive", lambda: (E > reg.get("Epp", 99)) &
+                 (E < reg.get("Eb", E[-1]))),
+            ]:
+                m = mask_fn()
+                if m.sum() > 3:
+                    rmse_region = np.sqrt(np.mean(residuals[m]**2))
+                    if rmse_region > 0.5:
+                        issues.append(("🟡 Poor fit in " + region_name,
+                                      f"RMSE = {rmse_region:.3f} decades in {region_name} region. "
+                                      "Model may not capture the exact behavior here."))
+
+    # 8. Physically unreasonable parameters
+    if best_p is not None:
+        icorr = best_p[1]
+        if icorr > 1e-1:
+            issues.append(("🔴 Very high icorr",
+                          f"icorr = {icorr:.2e} A/cm² is extremely high. "
+                          "Check electrode area or unit conversion."))
+        if icorr < 1e-12:
+            issues.append(("🟡 Very low icorr",
+                          f"icorr = {icorr:.2e} A/cm² is unusually low. "
+                          "Check if the data spans Ecorr properly."))
+
+    # 9. Fit quality summary
+    if r2_log is not None:
+        if r2_log < 0.90:
+            issues.append(("🔴 Poor overall fit",
+                          f"R²(log) = {r2_log:.4f}. The data may contain features "
+                          "not captured by standard electrochemical models: "
+                          "hydrogen evolution/oxidation coupling, adsorption pseudocapacitance, "
+                          "surface roughness effects, or experimental artifacts."))
+
+    return issues
 
 
 # ═══════════════════════════════════════════════════════════════
 # PLOTS
 # ═══════════════════════════════════════════════════════════════
 
-def _eval_global_model(E_range, best):
-    """Evaluate global model across a potential range."""
-    keys = ["Ecorr","icorr","ba","bc","ipass","iL","Eb","a_tp","b_tp"]
-    if all(k in best for k in keys):
-        return global_model(E_range, *[best[k] for k in keys])
-    return None
-
-
-def plot_polarization(E, i, R, reg, curve_type):
-    an = R.get("an", {})
-    ca = R.get("ca", {})
-    best = R.get("best", {})
-    pas = R.get("passive", {})
-    log_i = safe_log10(i)
-
+def plot_main(E, i, best_p, reg, ct):
+    log_i = safe_log(i)
     fig = go.Figure()
 
-    # ── Region fills ────────────────────────────────────
-    if pas.get("E_start") is not None:
-        fig.add_vrect(x0=pas["E_start"], x1=pas["E_end"],
-                      fillcolor=C["passive"], layer="below", line_width=0,
-                      annotation=dict(text="Passive",
-                                      font=dict(color="#a6e3a1", size=11), yanchor="top"))
-    if reg.get("E_lim_start") is not None:
-        fig.add_vrect(x0=reg["E_lim_start"], x1=reg["E_lim_end"],
-                      fillcolor=C["limiting"], layer="below", line_width=0,
-                      annotation=dict(text="Limiting",
-                                      font=dict(color="#89dceb", size=11), yanchor="top"))
-    if reg.get("tp_idx") is not None:
-        tp_start = E[reg["tp_idx"]] if reg["tp_idx"] < len(E) else E[-1]
-        fig.add_vrect(x0=tp_start, x1=float(E[-1]),
-                      fillcolor=C["transpassive"], layer="below", line_width=0,
-                      annotation=dict(text="Transpassive",
-                                      font=dict(color="#fab387", size=11), yanchor="top"))
-
-    # ── Key vertical lines ──────────────────────────────
-    Ec = reg["Ecorr"]
-    fig.add_vline(x=Ec, line=dict(color="#f38ba8", width=1.5, dash="dot"),
-                  annotation=dict(text="Ecorr", font=dict(color="#f38ba8", size=10),
-                                  yanchor="bottom"))
-    if reg.get("Eb"):
-        fig.add_vline(x=reg["Eb"], line=dict(color="#f38ba8", width=1.5, dash="dash"),
-                      annotation=dict(text="Eb", font=dict(color="#f38ba8", size=10),
+    # Region fills
+    if "pass1" in reg:
+        p = reg["pass1"]
+        fig.add_vrect(x0=p["E_s"], x1=p["E_e"], fillcolor=C["passive"],
+                      layer="below", line_width=0,
+                      annotation=dict(text="Passive", font=dict(color="#a6e3a1", size=11),
                                       yanchor="top"))
+    if "pass2" in reg:
+        p = reg["pass2"]
+        fig.add_vrect(x0=p["E_s"], x1=p["E_e"],
+                      fillcolor=C["sec_passive"], layer="below", line_width=0,
+                      annotation=dict(text="2nd Passive", font=dict(color="#cba6f7", size=10),
+                                      yanchor="top"))
+    if "E_lim_s" in reg:
+        fig.add_vrect(x0=reg["E_lim_s"], x1=reg["E_lim_e"],
+                      fillcolor=C["limiting"], layer="below", line_width=0,
+                      annotation=dict(text="Limiting", font=dict(color="#89dceb", size=11),
+                                      yanchor="top"))
+    if reg.get("Eb"):
+        tp_end = reg.get("Esp", E[-1])
+        fig.add_vrect(x0=reg["Eb"], x1=tp_end,
+                      fillcolor=C["transpassive"], layer="below", line_width=0,
+                      annotation=dict(text="Transpassive", font=dict(color="#fab387", size=10),
+                                      yanchor="top"))
+
+    # Key lines
+    Ec = reg["Ecorr"]
+    fig.add_vline(x=Ec, line=dict(color=C["ecorr"], width=1.5, dash="dot"),
+                  annotation=dict(text="Ecorr", font=dict(color=C["ecorr"], size=10)))
     if reg.get("Epp"):
         fig.add_vline(x=reg["Epp"], line=dict(color="#a6e3a1", width=1, dash="dot"),
-                      annotation=dict(text="Epp", font=dict(color="#a6e3a1", size=10),
-                                      yanchor="bottom"))
+                      annotation=dict(text="Epp", font=dict(color="#a6e3a1", size=10)))
+    if reg.get("Eb"):
+        fig.add_vline(x=reg["Eb"], line=dict(color="#f38ba8", width=1, dash="dash"),
+                      annotation=dict(text="Eb", font=dict(color="#f38ba8", size=10)))
 
-    # ── Measured data ───────────────────────────────────
+    # Measured data
     fig.add_trace(go.Scatter(x=E, y=log_i, mode="lines", name="Measured",
-                             line=dict(color=C["data"], width=2.5),
-                             hovertemplate="E=%{x:.4f} V<br>log|i|=%{y:.3f}<extra></extra>"))
-
-    # ── Tafel lines (in their valid window only) ────────
-    if an.get("slope"):
-        an_lo = Ec + an.get("lo", 0) - 0.02
-        an_hi = Ec + an.get("hi", 0.15) + 0.03
-        E_an = np.linspace(an_lo, min(an_hi, reg.get("E_ps", an_hi)), 80)
-        fig.add_trace(go.Scatter(
-            x=E_an, y=an["slope"]*E_an + an["intercept"], mode="lines",
-            name=f"Anodic Tafel βa={an['ba']*1000:.0f} mV/dec R²={an['r2']:.3f}",
-            line=dict(color=C["anodic"], width=1.5, dash="dash")))
-
-    if ca.get("slope"):
-        ca_hi = Ec - ca.get("lo", 0) + 0.02
-        ca_lo = Ec - ca.get("hi", 0.15) - 0.03
-        E_ca = np.linspace(max(ca_lo, reg.get("E_lim_end", ca_lo)), ca_hi, 80)
-        fig.add_trace(go.Scatter(
-            x=E_ca, y=ca["slope"]*E_ca + ca["intercept"], mode="lines",
-            name=f"Cathodic Tafel βc={ca['bc']*1000:.0f} mV/dec R²={ca['r2']:.3f}",
-            line=dict(color=C["cathodic"], width=1.5, dash="dash")))
-
-    # ── GLOBAL MODEL FIT (overlays entire curve) ────────
-    E_model = np.linspace(E.min(), E.max(), 600)
-    i_model = _eval_global_model(E_model, best)
-    if i_model is not None:
-        r2l = best.get("r2_log")
-        r2_str = f"R²(log)={r2l:.3f}" if r2l is not None else ""
-        method = best.get("method", "Global Fit")
-        fig.add_trace(go.Scatter(
-            x=E_model, y=safe_log10(i_model), mode="lines",
-            name=f"Global Fit  {r2_str}",
-            line=dict(color=C["global_fit"], width=3)))
-
-    # ── icorr marker ────────────────────────────────────
-    ic = best.get("icorr") or R.get("icorr_tafel")
-    ec = best.get("Ecorr") or Ec
-    if ic and ec:
-        fig.add_trace(go.Scatter(
-            x=[ec], y=[np.log10(max(ic, 1e-20))], mode="markers",
-            name=f"icorr = {ic:.3e} A/cm²",
-            marker=dict(symbol="x-thin", size=18, color="#f38ba8",
-                        line=dict(width=4, color="#f38ba8"))))
-
-    # ── iL line ─────────────────────────────────────────
-    if reg.get("iL") and curve_type in (CurveType.DIFFUSION_LIMITED, CurveType.MIXED):
-        fig.add_hline(y=np.log10(reg["iL"]),
-                      line=dict(color="#89dceb", width=1, dash="dot"),
-                      annotation=dict(text=f"iL={reg['iL']:.2e}",
-                                      font=dict(color="#89dceb", size=10)))
-
-    fig.update_layout(
-        template="plotly_dark", plot_bgcolor=C["bg"], paper_bgcolor=C["paper"],
-        title=dict(text="Potentiodynamic Polarization Curve — Global Fit",
-                   font=dict(size=17, color=C["text"]), x=0.0),
-        xaxis=dict(title="Potential (V vs Ref)", gridcolor=C["grid"],
-                   color=C["text"], zeroline=False, showline=True, linecolor=C["grid"]),
-        yaxis=dict(title="log₁₀|i| (A cm⁻²)", gridcolor=C["grid"],
-                   color=C["text"], zeroline=False, showline=True, linecolor=C["grid"]),
-        legend=dict(bgcolor="rgba(24,24,37,0.9)", bordercolor=C["grid"],
-                    font=dict(color=C["text"], size=11), x=0.01, y=0.01),
-        height=520, margin=dict(l=70, r=20, t=50, b=60),
-        hovermode="x unified",
-    )
-    return fig
-
-
-def plot_active_zoom(E, i, R, reg, curve_type):
-    an = R.get("an", {})
-    ca = R.get("ca", {})
-    best = R.get("best", {})
-    Ec = reg["Ecorr"]
-    log_i = safe_log10(i)
-
-    hw = 0.20 if curve_type == CurveType.PASSIVE else 0.30
-    E_ps = reg.get("E_ps")
-    zm_hi = min(Ec + hw, E_ps + 0.03) if E_ps else Ec + hw
-    zm = (E >= Ec - hw - 0.05) & (E <= zm_hi)
-    E_z, y_z = E[zm], log_i[zm]
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=E_z, y=y_z, mode="lines", name="Measured",
                              line=dict(color=C["data"], width=2.5)))
 
-    E_fit = np.linspace(E_z.min(), E_z.max(), 200)
-    if an.get("slope"):
-        fig.add_trace(go.Scatter(x=E_fit, y=an["slope"]*E_fit+an["intercept"],
-                                 mode="lines",
-                                 name=f"Anodic βa={an['ba']*1000:.0f}",
-                                 line=dict(color=C["anodic"], width=2, dash="dash")))
-    if ca.get("slope"):
-        fig.add_trace(go.Scatter(x=E_fit, y=ca["slope"]*E_fit+ca["intercept"],
-                                 mode="lines",
-                                 name=f"Cathodic βc={ca['bc']*1000:.0f}",
-                                 line=dict(color=C["cathodic"], width=2, dash="dash")))
+    # Global fit
+    if best_p is not None:
+        E_m = np.linspace(E.min(), E.max(), 800)
+        try:
+            i_m = global_model(E_m, best_p)
+            r2 = _r2(log_i, safe_log(global_model(E, best_p)))
+            fig.add_trace(go.Scatter(
+                x=E_m, y=safe_log(i_m), mode="lines",
+                name=f"Global Fit  R²(log)={r2:.4f}",
+                line=dict(color=C["fit"], width=3)))
+        except: pass
 
-    # Global model in zoom
-    i_model = _eval_global_model(E_fit, best)
-    if i_model is not None:
-        fig.add_trace(go.Scatter(x=E_fit, y=safe_log10(i_model), mode="lines",
-                                 name="Global Fit",
-                                 line=dict(color=C["global_fit"], width=3)))
-
-    ic = best.get("icorr") or R.get("icorr_tafel")
-    ec = best.get("Ecorr") or Ec
-    if ic:
+        # icorr marker
         fig.add_trace(go.Scatter(
-            x=[ec], y=[np.log10(max(ic, 1e-20))], mode="markers",
-            name=f"icorr={ic:.3e}",
-            marker=dict(symbol="x-thin", size=18, color="#f38ba8",
-                        line=dict(width=4, color="#f38ba8"))))
-    fig.add_vline(x=Ec, line=dict(color="#f38ba8", width=1, dash="dot"))
+            x=[best_p[0]], y=[np.log10(max(best_p[1], 1e-20))],
+            mode="markers", name=f"icorr = {best_p[1]:.3e} A/cm²",
+            marker=dict(symbol="x-thin", size=18, color=C["ecorr"],
+                        line=dict(width=4, color=C["ecorr"]))))
 
     fig.update_layout(
         template="plotly_dark", plot_bgcolor=C["bg"], paper_bgcolor=C["paper"],
-        title=dict(text="Active / Tafel Region (zoom)", font=dict(size=15, color=C["text"])),
-        xaxis=dict(title="Potential (V)", gridcolor=C["grid"], color=C["text"]),
+        title=dict(text="Potentiodynamic Polarization — Global Fit",
+                   font=dict(size=17, color=C["text"])),
+        xaxis=dict(title="Potential (V vs Ref)", gridcolor=C["grid"], color=C["text"]),
         yaxis=dict(title="log₁₀|i| (A cm⁻²)", gridcolor=C["grid"], color=C["text"]),
-        legend=dict(bgcolor="rgba(24,24,37,0.9)", bordercolor=C["grid"],
-                    font=dict(color=C["text"], size=11)),
-        height=420, margin=dict(l=70, r=20, t=50, b=60),
-    )
+        legend=dict(bgcolor="rgba(19,19,32,0.9)", bordercolor=C["grid"],
+                    font=dict(color=C["text"], size=11), x=0.01, y=0.01),
+        height=540, margin=dict(l=70, r=20, t=50, b=60), hovermode="x unified")
     return fig
 
 
-def plot_residuals(E, i, R, reg, curve_type):
-    best = R.get("best", {})
-    log_abs_data = safe_log10(i)
+def plot_components(E, best_p, reg, ct):
+    if best_p is None: return None
+    E_m = np.linspace(E.min(), E.max(), 800)
+    comp = global_model_components(E_m, best_p)
 
-    i_model = _eval_global_model(E, best)
-    if i_model is None:
-        return None
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=E_m, y=safe_log(comp["i_cathodic"]),
+                             mode="lines", name="Cathodic",
+                             line=dict(color=C["cathodic"], width=1.5, dash="dot")))
+    fig.add_trace(go.Scatter(x=E_m, y=safe_log(comp["i_active"]),
+                             mode="lines", name="Active dissolution (Tafel)",
+                             line=dict(color=C["anodic"], width=1, dash="dash")))
+    fig.add_trace(go.Scatter(x=E_m, y=safe_log(comp["i_after_pass1"]),
+                             mode="lines", name="After primary passivation",
+                             line=dict(color="#a6e3a1", width=1.5, dash="dot")))
+    if ct not in (CT.ACTIVE, CT.ACTIVE_DIFF):
+        fig.add_trace(go.Scatter(x=E_m, y=safe_log(comp["i_tp"]),
+                                 mode="lines", name="Transpassive",
+                                 line=dict(color="#fab387", width=1.5, dash="dot")))
+    fig.add_trace(go.Scatter(x=E_m, y=safe_log(comp["i_total"]),
+                             mode="lines", name="Total (model)",
+                             line=dict(color=C["fit"], width=3)))
 
-    log_model = safe_log10(i_model)
-    residuals = log_abs_data - log_model
+    # Film coverage
+    fig.add_trace(go.Scatter(x=E_m, y=comp["theta1"]*3 - 12,
+                             mode="lines", name="θ₁ (primary film)",
+                             line=dict(color="#94e2d5", width=1, dash="dash"),
+                             yaxis="y2"))
+    if ct in (CT.PASSIVE_TP_SP, CT.FULL):
+        fig.add_trace(go.Scatter(x=E_m, y=comp["theta2"]*3 - 12,
+                                 mode="lines", name="θ₂ (secondary film)",
+                                 line=dict(color="#cba6f7", width=1, dash="dash"),
+                                 yaxis="y2"))
+
+    fig.update_layout(
+        template="plotly_dark", plot_bgcolor=C["bg"], paper_bgcolor=C["paper"],
+        title=dict(text="Model Component Breakdown", font=dict(size=15, color=C["text"])),
+        xaxis=dict(title="Potential (V)", gridcolor=C["grid"], color=C["text"]),
+        yaxis=dict(title="log₁₀|i| (A cm⁻²)", gridcolor=C["grid"], color=C["text"]),
+        legend=dict(bgcolor="rgba(19,19,32,0.9)", bordercolor=C["grid"],
+                    font=dict(color=C["text"], size=10)),
+        height=420, margin=dict(l=70, r=20, t=50, b=60))
+    return fig
+
+
+def plot_residuals(E, i, best_p):
+    if best_p is None: return None
+    log_d = safe_log(i)
+    pred = global_model(E, best_p)
+    log_p = safe_log(pred)
+    res = log_d - log_p
+    rmse = np.sqrt(np.mean(res**2))
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         row_heights=[0.55, 0.45], vertical_spacing=0.06,
-                        subplot_titles=("Global Fit Overlay",
-                                        "Residuals in log-space"))
+                        subplot_titles=("Data vs Global Fit", "Residuals (log-space)"))
 
-    fig.add_trace(go.Scatter(x=E, y=log_abs_data, mode="lines", name="Measured",
+    fig.add_trace(go.Scatter(x=E, y=log_d, mode="lines", name="Measured",
                              line=dict(color=C["data"], width=2)), row=1, col=1)
+    E_m = np.linspace(E.min(), E.max(), 600)
+    fig.add_trace(go.Scatter(x=E_m, y=safe_log(global_model(E_m, best_p)),
+                             mode="lines", name="Global Fit",
+                             line=dict(color=C["fit"], width=2.5)), row=1, col=1)
 
-    E_dense = np.linspace(E.min(), E.max(), 600)
-    i_dense = _eval_global_model(E_dense, best)
-    if i_dense is not None:
-        fig.add_trace(go.Scatter(x=E_dense, y=safe_log10(i_dense), mode="lines",
-                                 name="Global Fit",
-                                 line=dict(color=C["global_fit"], width=2.5)), row=1, col=1)
-
-    fig.add_trace(go.Scatter(x=E, y=residuals, mode="lines",
-                             name="Residual",
-                             line=dict(color="#fab387", width=1.2),
-                             fill="tozeroy",
-                             fillcolor="rgba(250,179,135,0.08)"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=E, y=res, mode="lines", name="Residual",
+                             line=dict(color="#fab387", width=1),
+                             fill="tozeroy", fillcolor="rgba(250,179,135,0.06)"), row=2, col=1)
     fig.add_hline(y=0, line=dict(color="#585b70", width=1, dash="dot"), row=2)
 
-    rmse = float(np.sqrt(np.mean(residuals**2)))
-    max_res = float(np.max(np.abs(residuals)))
-    fig.add_annotation(text=f"RMSE(log) = {rmse:.4f}  |  max = {max_res:.3f} dec",
+    fig.add_annotation(text=f"RMSE(log) = {rmse:.4f}",
                        xref="paper", yref="paper", x=0.98, y=0.38,
                        showarrow=False, font=dict(color="#a6adc8", size=11),
-                       bgcolor="rgba(24,24,37,0.8)", bordercolor=C["grid"])
+                       bgcolor="rgba(19,19,32,0.8)", bordercolor=C["grid"])
 
-    # Mark regions in residual plot
-    if reg.get("E_lim_start"):
-        for row in (1, 2):
-            fig.add_vrect(x0=reg["E_lim_start"], x1=reg["E_lim_end"],
-                          fillcolor="rgba(137,220,235,0.06)", layer="below",
-                          line_width=0, row=row)
-    pas = R.get("passive", {})
-    if pas.get("E_start"):
-        for row in (1, 2):
-            fig.add_vrect(x0=pas["E_start"], x1=pas["E_end"],
-                          fillcolor="rgba(166,227,161,0.06)", layer="below",
-                          line_width=0, row=row)
-
-    fig.update_layout(
-        template="plotly_dark", plot_bgcolor=C["bg"], paper_bgcolor=C["paper"],
-        height=440, margin=dict(l=70, r=20, t=40, b=60), showlegend=True,
-        legend=dict(bgcolor="rgba(24,24,37,0.9)", bordercolor=C["grid"],
-                    font=dict(color=C["text"], size=11)),
-    )
+    fig.update_layout(template="plotly_dark", plot_bgcolor=C["bg"],
+                      paper_bgcolor=C["paper"], height=440,
+                      margin=dict(l=70, r=20, t=40, b=60), showlegend=True,
+                      legend=dict(bgcolor="rgba(19,19,32,0.9)", bordercolor=C["grid"],
+                                  font=dict(color=C["text"], size=11)))
     fig.update_yaxes(gridcolor=C["grid"], color=C["text"])
     fig.update_xaxes(gridcolor=C["grid"], color=C["text"], title_text="Potential (V)", row=2)
     return fig
 
 
-def plot_component_breakdown(E, R, reg, curve_type):
-    """Show individual current components of the global model."""
-    best = R.get("best", {})
-    keys = ["Ecorr","icorr","ba","bc","ipass","iL","Eb","a_tp","b_tp"]
-    if not all(k in best for k in keys):
-        return None
-
-    E_m = np.linspace(E.min(), E.max(), 600)
-    eta = E_m - best["Ecorr"]
-
-    # Anodic (activation → passive limited)
-    i_a_kin = best["icorr"] * np.exp(2.303 * eta / best["ba"])
-    i_anodic = i_a_kin * best["ipass"] / (i_a_kin + best["ipass"])
-
-    # Cathodic (activation → diffusion limited)
-    i_c_kin = best["icorr"] * np.exp(-2.303 * eta / best["bc"])
-    i_cathodic = i_c_kin / (1.0 + i_c_kin / best["iL"])
-
-    # Transpassive
-    sigmoid_tp = 1.0 / (1.0 + np.exp(-40.0 * (E_m - best["Eb"])))
-    i_tp = best["a_tp"] * np.exp(np.clip(best["b_tp"] * (E_m - best["Eb"]), -50, 50)) * sigmoid_tp
-
-    # Total
-    i_total = i_anodic - i_cathodic + i_tp
-
-    fig = go.Figure()
-
-    fig.add_trace(go.Scatter(x=E_m, y=safe_log10(i_anodic), mode="lines",
-                             name="Anodic (active→passive)",
-                             line=dict(color="#f9e2af", width=1.5, dash="dot")))
-    fig.add_trace(go.Scatter(x=E_m, y=safe_log10(i_cathodic), mode="lines",
-                             name="Cathodic (kinetic→diffusion)",
-                             line=dict(color="#cba6f7", width=1.5, dash="dot")))
-    if curve_type in (CurveType.PASSIVE, CurveType.MIXED):
-        valid_tp = i_tp > 1e-15
-        if valid_tp.any():
-            fig.add_trace(go.Scatter(x=E_m[valid_tp], y=safe_log10(i_tp[valid_tp]),
-                                     mode="lines", name="Transpassive",
-                                     line=dict(color="#fab387", width=1.5, dash="dot")))
-
-    fig.add_trace(go.Scatter(x=E_m, y=safe_log10(i_total), mode="lines",
-                             name="Total (global model)",
-                             line=dict(color=C["global_fit"], width=3)))
-
-    # ipass horizontal line
-    if curve_type in (CurveType.PASSIVE, CurveType.MIXED):
-        fig.add_hline(y=np.log10(best["ipass"]),
-                      line=dict(color="#a6e3a1", width=1, dash="dot"),
-                      annotation=dict(text=f"ipass={best['ipass']:.2e}",
-                                      font=dict(color="#a6e3a1", size=10)))
-    if curve_type in (CurveType.DIFFUSION_LIMITED, CurveType.MIXED):
-        fig.add_hline(y=np.log10(best["iL"]),
-                      line=dict(color="#89dceb", width=1, dash="dot"),
-                      annotation=dict(text=f"iL={best['iL']:.2e}",
-                                      font=dict(color="#89dceb", size=10)))
-
-    fig.update_layout(
-        template="plotly_dark", plot_bgcolor=C["bg"], paper_bgcolor=C["paper"],
-        title=dict(text="Model Component Breakdown",
-                   font=dict(size=15, color=C["text"])),
-        xaxis=dict(title="Potential (V)", gridcolor=C["grid"], color=C["text"]),
-        yaxis=dict(title="log₁₀|i| (A cm⁻²)", gridcolor=C["grid"], color=C["text"]),
-        legend=dict(bgcolor="rgba(24,24,37,0.9)", bordercolor=C["grid"],
-                    font=dict(color=C["text"], size=11)),
-        height=420, margin=dict(l=70, r=20, t=50, b=60),
-    )
-    return fig
-
-
 # ═══════════════════════════════════════════════════════════════
-# PARAMETER CARDS
+# PARAMETER DISPLAY
 # ═══════════════════════════════════════════════════════════════
 
 def pcard(label, val, unit="", color="#cdd6f4"):
-    if val is None:
-        disp = "—"
-    elif isinstance(val, str):
-        disp = val
-    elif abs(val) < 0.001 or abs(val) > 9999:
-        disp = f"{val:.4e}"
-    else:
-        disp = f"{val:.4f}"
-    st.markdown(f"""
-    <div class="pcard">
-        <div class="plabel">{label}</div>
-        <div class="pval" style="color:{color}">{disp}</div>
-        <div class="punit">{unit}</div>
-    </div>""", unsafe_allow_html=True)
+    if val is None: disp = "—"
+    elif isinstance(val, str): disp = val
+    elif abs(val) < 0.001 or abs(val) > 9999: disp = f"{val:.4e}"
+    else: disp = f"{val:.4f}"
+    st.markdown(f'<div class="pcard"><div class="plabel">{label}</div>'
+                f'<div class="pval" style="color:{color}">{disp}</div>'
+                f'<div class="punit">{unit}</div></div>', unsafe_allow_html=True)
 
 
-def show_curve_type_banner(curve_type):
-    title, desc = CurveType.DESCRIPTIONS[curve_type]
-    clr = {"active_only": "#f9e2af", "passive": "#a6e3a1",
-           "diffusion_limited": "#89dceb", "mixed": "#cba6f7"}.get(curve_type, "#cdd6f4")
-    st.markdown(f"""
-    <div class="type-box">
-        <div class="type-title" style="color:{clr}">{title}</div>
-        <div class="type-desc">{desc}</div>
-    </div>""", unsafe_allow_html=True)
+def show_params(best_p, reg, ew, rho, ct, r2_log):
+    if best_p is None: return
+    p = dict(zip(PARAM_NAMES, best_p))
 
-
-def show_parameters(R, reg, ew, rho, curve_type):
-    best = R.get("best", {})
-    an = R.get("an", {})
-    ca = R.get("ca", {})
-    pas = R.get("passive", {})
-    rp_r = R.get("rp", {})
-
-    Ec = best.get("Ecorr", reg["Ecorr"])
-    ic = best.get("icorr")
-    ba = best.get("ba")
-    bc = best.get("bc")
-    B = best.get("B")
-    Rp = rp_r.get("Rp")
-    ic_sg = (B / Rp) if (B and Rp and Rp > 0) else None
+    # Derived quantities
+    ba, bc = p["ba"], p["bc"]
+    B = (ba*bc) / (2.303*(ba+bc)) if ba > 0 and bc > 0 else None
+    ic = p["icorr"]
     CR = ic * 3.27 * ew / rho if ic else None
-    CR_sg = ic_sg * 3.27 * ew / rho if ic_sg else None
 
     # Badges
     badges = []
-    if reg.get("E_lim_start") is not None:
-        badges.append('<span class="badge bb">Limiting current</span>')
-    if pas.get("E_start") is not None:
-        badges.append('<span class="badge bg">Passive region</span>')
-    if reg.get("Eb") is not None:
-        badges.append('<span class="badge br">Breakdown</span>')
-    if reg.get("tp_idx") is not None:
-        badges.append('<span class="badge by">Transpassive</span>')
-    if reg.get("Epp") is not None:
-        badges.append('<span class="badge bg">Epp / Flade</span>')
+    if "iL" in reg: badges.append('<span class="badge bb">Limiting</span>')
+    if "pass1" in reg: badges.append('<span class="badge bg">Passive</span>')
+    if reg.get("Eb"): badges.append('<span class="badge br">Breakdown</span>')
+    if "pass2" in reg: badges.append('<span class="badge bp">2nd Passive</span>')
+    if reg.get("anodic_peaks"):
+        badges.append(f'<span class="badge by">{len(reg["anodic_peaks"])} anodic peak(s)</span>')
     if badges:
-        st.markdown("**Detected regions:** " + "".join(badges), unsafe_allow_html=True)
-    show_curve_type_banner(curve_type)
+        st.markdown("**Detected:** " + "".join(badges), unsafe_allow_html=True)
 
-    col1, col2, col3, col4 = st.columns(4)
+    title, desc = CT.DESC.get(ct, ("Unknown", ""))
+    clr = {"active":"#f9e2af","active_diff":"#89dceb","passive":"#a6e3a1",
+           "passive_diff":"#94e2d5","passive_tp":"#fab387","passive_tp_sp":"#cba6f7",
+           "passive_pitting":"#f38ba8","full":"#f5c2e7"}.get(ct, "#cdd6f4")
+    st.markdown(f'<div class="type-box"><div class="type-title" style="color:{clr}">{title}</div>'
+                f'<div class="type-desc">{desc}</div></div>', unsafe_allow_html=True)
 
-    with col1:
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
         st.markdown('<div class="sechead">⚡ Corrosion</div>', unsafe_allow_html=True)
-        pcard("Ecorr", Ec, "V vs Ref", "#f38ba8")
-        pcard("icorr (Global fit)", ic, "A cm⁻²", "#fab387")
-        if ic_sg: pcard("icorr (Stern-Geary)", ic_sg, "A cm⁻²", "#f9e2af")
-        if CR:    pcard("Corrosion rate", CR, "mm year⁻¹", "#eba0ac")
-        if CR_sg: pcard("CR (Stern-Geary)", CR_sg, "mm year⁻¹", "#f5c2e7")
+        pcard("Ecorr", p["Ecorr"], "V vs Ref", "#f38ba8")
+        pcard("icorr", p["icorr"], "A cm⁻²", "#fab387")
+        if CR: pcard("Corrosion rate", CR, "mm yr⁻¹", "#eba0ac")
+        if B: pcard("B (Stern-Geary)", B*1000, "mV", "#89dceb")
 
-    with col2:
+    with c2:
         st.markdown('<div class="sechead">📐 Kinetics</div>', unsafe_allow_html=True)
-        pcard("βa  anodic Tafel", ba*1000 if ba else None, "mV dec⁻¹", "#a6e3a1")
-        pcard("βc  cathodic Tafel", bc*1000 if bc else None, "mV dec⁻¹", "#94e2d5")
-        if B:  pcard("B  Stern-Geary", B*1000, "mV", "#89dceb")
-        if Rp: pcard("Rp  polarization resist.", Rp, "Ω cm²", "#89b4fa")
-
-        m = best.get("method", "—")
-        r2l = best.get("r2_log")
-        r2 = best.get("r2_lin")
-        parts = []
-        if r2l is not None: parts.append(f"R²(log) = {r2l:.4f}")
-        if r2 is not None:  parts.append(f"R²(lin) = {r2:.4f}")
-        cls = "ok-box" if (r2l and r2l >= 0.95) else "warn-box"
-        pfx = "✅" if (r2l and r2l >= 0.95) else "⚠️"
-        st.markdown(f'<div class="{cls}">{pfx} {m}<br>{", ".join(parts)}</div>',
+        pcard("βa anodic", ba*1000, "mV dec⁻¹", "#a6e3a1")
+        pcard("βc cathodic", bc*1000, "mV dec⁻¹", "#94e2d5")
+        cls = "ok-box" if r2_log and r2_log >= 0.97 else "warn-box"
+        pfx = "✅" if r2_log and r2_log >= 0.97 else "⚠️"
+        st.markdown(f'<div class="{cls}">{pfx} R²(log) = {r2_log:.5f}</div>',
                     unsafe_allow_html=True)
 
-    with col3:
+    with c3:
         st.markdown('<div class="sechead">🛡️ Passivity</div>', unsafe_allow_html=True)
-        if curve_type in (CurveType.PASSIVE, CurveType.MIXED):
-            pcard("ipass (fitted)", best.get("ipass"), "A cm⁻²", "#a6e3a1")
-            if pas:
-                pcard("ipass (measured)", pas.get("ipass"), "A cm⁻²", "#94e2d5")
-                pcard("Passive start", pas.get("E_start"), "V", "#94e2d5")
-                pcard("Passive end", pas.get("E_end"), "V", "#94e2d5")
-                pcard("Passive range", pas.get("range_V", 0)*1000, "mV", "#a6adc8")
-            if reg.get("Epp") is not None:
-                pcard("Epp / Flade", reg["Epp"], "V", "#a6e3a1")
+        if ct not in (CT.ACTIVE, CT.ACTIVE_DIFF):
+            pcard("Epp", p["Epp"], "V", "#a6e3a1")
+            pcard("ipass", p["ipass"], "A cm⁻²", "#94e2d5")
+            pcard("k_pass (sharpness)", p["k_pass"], "V⁻¹", "#a6adc8")
+            if ct in (CT.PASSIVE_TP_SP, CT.FULL):
+                pcard("Esp (2nd passive)", p["Esp"], "V", "#cba6f7")
+                pcard("ipass₂", p["ipass2"], "A cm⁻²", "#cba6f7")
         else:
-            st.info("No passive region detected.")
+            st.info("No passivation detected.")
 
-    with col4:
+    with c4:
         st.markdown('<div class="sechead">💥 Breakdown & Diffusion</div>', unsafe_allow_html=True)
         if reg.get("Eb"):
-            pcard("Eb  breakdown (detected)", reg["Eb"], "V", "#f38ba8")
-        if best.get("Eb") and curve_type in (CurveType.PASSIVE, CurveType.MIXED):
-            pcard("Eb  (fitted)", best["Eb"], "V", "#f38ba8")
-            if Ec: pcard("Pitting index Eb−Ecorr",
-                         (best["Eb"]-Ec)*1000, "mV", "#f38ba8")
-        if curve_type in (CurveType.DIFFUSION_LIMITED, CurveType.MIXED):
+            pcard("Eb breakdown", p["Eb"], "V", "#f38ba8")
+            pcard("Eb−Ecorr", (p["Eb"]-p["Ecorr"])*1000, "mV", "#f38ba8")
+            pcard("a_tp", p["a_tp"], "A cm⁻²", "#fab387")
+            pcard("b_tp", p["b_tp"], "V⁻¹", "#fab387")
+        if ct in (CT.ACTIVE_DIFF, CT.PASSIVE_DIFF, CT.FULL, CT.PASSIVE_TP_SP):
+            pcard("iL (fitted)", p["iL"], "A cm⁻²", "#89dceb")
             if reg.get("iL"):
-                pcard("iL (detected)", reg["iL"], "A cm⁻²", "#89dceb")
-            if best.get("iL"):
-                pcard("iL (fitted)", best["iL"], "A cm⁻²", "#89dceb")
-        if best.get("a_tp") and curve_type in (CurveType.PASSIVE, CurveType.MIXED):
-            pcard("Transpassive a_tp", best["a_tp"], "A cm⁻²", "#fab387")
-            pcard("Transpassive b_tp", best["b_tp"], "V⁻¹", "#fab387")
-
-
-def build_summary_df(R, reg, ew, rho, curve_type):
-    best = R.get("best", {})
-    an, ca, pas, rp_r = R.get("an",{}), R.get("ca",{}), R.get("passive",{}), R.get("rp",{})
-    Ec = best.get("Ecorr", reg["Ecorr"])
-    ic = best.get("icorr")
-    ba, bc = best.get("ba"), best.get("bc")
-    B = best.get("B")
-    Rp = rp_r.get("Rp")
-    CR = ic * 3.27 * ew / rho if ic else None
-    ic_sg = B/Rp if (B and Rp) else None
-    CR_sg = ic_sg * 3.27 * ew / rho if ic_sg else None
-
-    rows = [
-        ("Curve Type", CurveType.DESCRIPTIONS[curve_type][0]),
-        ("Ecorr (V)", Ec), ("icorr (A/cm²)", ic),
-        ("icorr_SG (A/cm²)", ic_sg),
-        ("βa (mV/dec)", ba*1000 if ba else None),
-        ("βc (mV/dec)", bc*1000 if bc else None),
-        ("B (mV)", B*1000 if B else None),
-        ("Rp (Ω·cm²)", Rp),
-        ("CR (mm/yr)", CR), ("CR_SG (mm/yr)", CR_sg),
-        ("ipass fitted (A/cm²)", best.get("ipass")),
-        ("ipass measured (A/cm²)", pas.get("ipass")),
-        ("iL fitted (A/cm²)", best.get("iL")),
-        ("iL detected (A/cm²)", reg.get("iL")),
-        ("Eb fitted (V)", best.get("Eb")),
-        ("Eb detected (V)", reg.get("Eb")),
-        ("Epp (V)", reg.get("Epp")),
-        ("a_tp (A/cm²)", best.get("a_tp")),
-        ("b_tp (V⁻¹)", best.get("b_tp")),
-        ("Method", best.get("method")),
-        ("R²(log)", best.get("r2_log")),
-        ("R²(lin)", best.get("r2_lin")),
-    ]
-    return pd.DataFrame(rows, columns=["Parameter", "Value"])
+                pcard("iL (detected)", reg["iL"], "A cm⁻²", "#89b4fa")
 
 
 # ═══════════════════════════════════════════════════════════════
 # MATERIALS
 # ═══════════════════════════════════════════════════════════════
 MATERIALS = {
-    "Carbon Steel / Iron": (27.92, 7.87),
-    "304 Stainless Steel": (25.10, 7.90),
-    "316 Stainless Steel": (25.56, 8.00),
-    "Copper": (31.77, 8.96),
-    "Aluminum": (8.99, 2.70),
-    "Nickel": (29.36, 8.91),
-    "Titanium": (11.99, 4.51),
-    "Zinc": (32.69, 7.14),
-    "Custom": (27.92, 7.87),
+    "Carbon Steel / Iron": (27.92, 7.87), "304 Stainless Steel": (25.10, 7.90),
+    "316 Stainless Steel": (25.56, 8.00), "Copper": (31.77, 8.96),
+    "Aluminum": (8.99, 2.70), "Nickel": (29.36, 8.91),
+    "Titanium": (11.99, 4.51), "Zinc": (32.69, 7.14), "Custom": (27.92, 7.87),
 }
 
 
 # ═══════════════════════════════════════════════════════════════
-# DEMO DATA
+# DEMO DATA (using the global model itself for perfect test cases)
 # ═══════════════════════════════════════════════════════════════
 
-def run_demo(choice):
+def make_demo(choice):
     np.random.seed(42)
-
-    if "full" in choice.lower() or "breakdown" in choice.lower():
-        E = np.linspace(-0.65, 0.85, 500)
-        Ecorr, icorr, ba, bc = -0.38, 2e-6, 0.065, 0.110
-        ipass, iL = 5e-6, 5e-4
-        Eb, a_tp, b_tp = 0.55, 5e-6, 12.0
-        i = global_model(E, Ecorr, icorr, ba, bc, ipass, iL, Eb, a_tp, b_tp)
-
-    elif "active" in choice.lower():
-        E = np.linspace(-0.65, 0.45, 400)
-        i = 5e-6*(np.exp(2.303*(E+0.45)/0.06) - np.exp(-2.303*(E+0.45)/0.12))
-
+    if "secondary" in choice.lower() or "full" in choice.lower():
+        # Full: active peak + passive + transpassive + secondary passive
+        E = np.linspace(-0.65, 1.0, 600)
+        p = [-0.38, 3e-6, 0.060, 0.110, 5e-4,
+             -0.10, 50.0, 4e-6,
+             0.50, 2e-6, 10.0,
+             0.80, 40.0, 3e-6]
+        i = global_model(E, p)
+    elif "pitting" in choice.lower():
+        E = np.linspace(-0.55, 0.55, 400)
+        p = [-0.35, 2e-6, 0.055, 0.120, 1e3,
+             -0.05, 60.0, 3e-6,
+             0.35, 1e-4, 25.0,
+             1.5, 0.01, 1e3]
+        i = global_model(E, p)
+    elif "passive" in choice.lower() and "trans" in choice.lower():
+        E = np.linspace(-0.55, 0.75, 450)
+        p = [-0.38, 2e-6, 0.065, 0.110, 1e3,
+             -0.10, 45.0, 5e-6,
+             0.55, 3e-6, 8.0,
+             1.5, 0.01, 1e3]
+        i = global_model(E, p)
+    elif "passive" in choice.lower():
+        E = np.linspace(-0.55, 0.50, 400)
+        p = [-0.40, 2e-6, 0.065, 0.110, 1e3,
+             -0.15, 50.0, 4e-6,
+             0.8, 1e-15, 1.0,
+             1.5, 0.01, 1e3]
+        i = global_model(E, p)
     elif "diffusion" in choice.lower():
         E = np.linspace(-0.80, 0.30, 400)
-        Ecorr, icorr, ba, bc = -0.40, 3e-6, 0.070, 0.120
-        iL = 2e-4
-        i = global_model(E, Ecorr, icorr, ba, bc, 1e3, iL, 0.8, 1e-15, 1.0)
+        p = [-0.40, 3e-6, 0.070, 0.120, 2e-4,
+             0.8, 0.01, 1e3,
+             1.5, 1e-15, 1.0,
+             2.0, 0.01, 1e3]
+        i = global_model(E, p)
+    else:  # active only
+        E = np.linspace(-0.65, 0.40, 350)
+        p = [-0.45, 5e-6, 0.060, 0.120, 1e3,
+             0.8, 0.01, 1e3,
+             1.5, 1e-15, 1.0,
+             2.0, 0.01, 1e3]
+        i = global_model(E, p)
 
-    else:  # passive only
-        E = np.linspace(-0.55, 0.70, 400)
-        Ecorr, icorr, ba, bc = -0.40, 2e-6, 0.065, 0.110
-        ipass = 4e-6
-        i = global_model(E, Ecorr, icorr, ba, bc, ipass, 1e3, 0.60, 3e-6, 8.0)
-
-    noise = np.random.normal(0, np.abs(i)*0.03 + 3e-9, size=len(i))
+    noise = np.random.normal(0, np.abs(i)*0.03 + 3e-9, len(i))
     return E, i + noise
+
+
+# ═══════════════════════════════════════════════════════════════
+# SUMMARY CSV
+# ═══════════════════════════════════════════════════════════════
+
+def build_csv(best_p, reg, ew, rho, ct, r2_log, diags):
+    p = dict(zip(PARAM_NAMES, best_p)) if best_p is not None else {}
+    ba, bc = p.get("ba",0), p.get("bc",0)
+    B = (ba*bc)/(2.303*(ba+bc)) if ba > 0 and bc > 0 else None
+    ic = p.get("icorr")
+    CR = ic*3.27*ew/rho if ic else None
+
+    rows = [("Curve type", CT.DESC.get(ct,("?",""))[0]),
+            ("Ecorr (V)", p.get("Ecorr")),
+            ("icorr (A/cm²)", ic),
+            ("βa (mV/dec)", ba*1000 if ba else None),
+            ("βc (mV/dec)", bc*1000 if bc else None),
+            ("B (mV)", B*1000 if B else None),
+            ("CR (mm/yr)", CR),
+            ("ipass (A/cm²)", p.get("ipass")),
+            ("Epp (V)", p.get("Epp")),
+            ("k_pass (V⁻¹)", p.get("k_pass")),
+            ("iL (A/cm²)", p.get("iL")),
+            ("Eb (V)", p.get("Eb")),
+            ("a_tp", p.get("a_tp")),
+            ("b_tp (V⁻¹)", p.get("b_tp")),
+            ("Esp (V)", p.get("Esp")),
+            ("ipass2 (A/cm²)", p.get("ipass2")),
+            ("k_sp (V⁻¹)", p.get("k_sp")),
+            ("R²(log)", r2_log)]
+    for sev, msg in diags:
+        rows.append((sev, msg))
+    return pd.DataFrame(rows, columns=["Parameter", "Value"])
 
 
 # ═══════════════════════════════════════════════════════════════
 # MAIN PIPELINE
 # ═══════════════════════════════════════════════════════════════
 
-def process_and_display(E_raw, i_dens, area, ew, rho):
+def process_data(E, i_dens, area, ew, rho):
+    # ── Detect ──────────────────────────────────────────
     with st.spinner("Detecting regions & classifying curve…"):
-        reg = detect_regions(E_raw, i_dens)
-    curve_type = reg["curve_type"]
+        reg = detect_regions(E, i_dens)
+    ct = reg["curve_type"]
 
-    with st.spinner(f"Fitting global model ({CurveType.DESCRIPTIONS[curve_type][0]})…"):
-        fitter = GlobalFitter(E_raw, i_dens, reg)
-        R = fitter.run()
+    # ── Initial guess ───────────────────────────────────
+    with st.spinner("Building initial parameter estimates…"):
+        p0 = build_initial_guess(E, i_dens, reg)
 
-    # ── Plots ───────────────────────────────────────────
+    # ── Optimize ────────────────────────────────────────
+    with st.spinner("Running multi-stage global optimization…"):
+        opt = Optimizer(E, i_dens, reg, p0)
+        best_p = opt.run_all()
+
+    r2_log = _r2(safe_log(i_dens), safe_log(global_model(E, best_p))) if best_p is not None else None
+
+    # ── Diagnostics ─────────────────────────────────────
+    diags = diagnose_data(E, i_dens, reg, best_p, r2_log)
+
+    # ═══════════════════════════════════════════════════
+    # DISPLAY
+    # ═══════════════════════════════════════════════════
     st.markdown("---")
 
-    fig_full = plot_polarization(E_raw, i_dens, R, reg, curve_type)
-    st.plotly_chart(fig_full, use_container_width=True)
+    # Main plot
+    st.plotly_chart(plot_main(E, i_dens, best_p, reg, ct), use_container_width=True)
 
+    # Two-column: components + residuals
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(plot_active_zoom(E_raw, i_dens, R, reg, curve_type),
-                        use_container_width=True)
+        fig_comp = plot_components(E, best_p, reg, ct)
+        if fig_comp:
+            st.plotly_chart(fig_comp, use_container_width=True)
     with c2:
-        fig_res = plot_residuals(E_raw, i_dens, R, reg, curve_type)
+        fig_res = plot_residuals(E, i_dens, best_p)
         if fig_res:
             st.plotly_chart(fig_res, use_container_width=True)
 
-    # Component breakdown
-    if curve_type != CurveType.ACTIVE_ONLY:
-        with st.expander("🔬 Model component breakdown (anodic, cathodic, transpassive)"):
-            fig_comp = plot_component_breakdown(E_raw, R, reg, curve_type)
-            if fig_comp:
-                st.plotly_chart(fig_comp, use_container_width=True)
-
-    # ── Parameters ──────────────────────────────────────
+    # Parameters
     st.markdown("---")
-    show_parameters(R, reg, ew, rho, curve_type)
+    show_params(best_p, reg, ew, rho, ct, r2_log)
 
-    # ── Log & download ──────────────────────────────────
+    # ── Data Quality Diagnostics ────────────────────────
     st.markdown("---")
-    c_log, c_dl = st.columns([3, 1])
-    with c_log:
-        with st.expander("🪵 Fitting log (detailed)"):
-            for msg in fitter.log:
-                st.markdown(f"- {msg}")
-    with c_dl:
-        df_sum = build_summary_df(R, reg, ew, rho, curve_type)
-        st.download_button("⬇️ Results (CSV)", df_sum.to_csv(index=False).encode(),
-                           "tafel_results.csv", "text/csv", use_container_width=True)
-        df_proc = pd.DataFrame({"E_V": E_raw, "i_Acm2": i_dens,
-                                 "log_abs_i": safe_log10(i_dens)})
-        st.download_button("⬇️ Processed data (CSV)", df_proc.to_csv(index=False).encode(),
-                           "tafel_data.csv", "text/csv", use_container_width=True)
+    st.markdown("### 🔍 Data Quality Diagnostics")
+    for severity, message in diags:
+        if "🔴" in severity:
+            st.markdown(f'<div class="err-box"><b>{severity}</b><br>{message}</div>',
+                        unsafe_allow_html=True)
+        elif "🟡" in severity:
+            st.markdown(f'<div class="warn-box"><b>{severity}</b><br>{message}</div>',
+                        unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="ok-box"><b>{severity}</b><br>{message}</div>',
+                        unsafe_allow_html=True)
 
-    # ── Model equation display ──────────────────────────
-    best = R.get("best", {})
-    if best.get("success"):
-        with st.expander("📐 Global model equation"):
+    # ── Model equation ──────────────────────────────────
+    if best_p is not None:
+        with st.expander("📐 Global model equation & physics"):
+            p = dict(zip(PARAM_NAMES, best_p))
             st.markdown(f"""
-**Global Polarization Model:**
+**Film-Coverage Global Polarization Model:**
 
-```
-i_total = i_anodic − i_cathodic + i_transpassive
-```
+The model uses a film-coverage approach where passive films progressively
+block active dissolution sites:
 
-**Anodic** (activation → passive-limited):
-```
-i_a_kinetic = icorr · exp(2.303·η / βa)
-i_anodic = i_a_kinetic · ipass / (i_a_kinetic + ipass)
-```
-→ When i_a << ipass: pure Tafel kinetics
-→ When i_a >> ipass: saturates at ipass = **{best.get('ipass', 0):.3e}** A/cm²
-
-**Cathodic** (activation → diffusion-limited):
+**Cathodic** (activation → diffusion limited):
 ```
 i_c_kinetic = icorr · exp(−2.303·η / βc)
-i_cathodic = i_c_kinetic / (1 + i_c_kinetic / iL)
+i_cathodic  = i_c_kinetic / (1 + i_c_kinetic / iL)
 ```
-→ When i_c << iL: pure Tafel kinetics
-→ When i_c >> iL: saturates at iL = **{best.get('iL', 0):.3e}** A/cm²
+iL = **{p['iL']:.3e}** A/cm²
 
-**Transpassive** (above Eb):
+**Anodic** (active dissolution):
 ```
-i_tp = a_tp · exp(b_tp · (E − Eb)) · σ(E − Eb)
+i_active = icorr · exp(2.303·η / βa)
 ```
-→ σ = sigmoid turn-on at Eb = **{best.get('Eb', 0):.3f}** V
+This produces the exponential rise from Ecorr (the "active region").
 
-**Fitted parameters:**
-- Ecorr = {best.get('Ecorr', 0):.4f} V, icorr = {best.get('icorr', 0):.3e} A/cm²
-- βa = {best.get('ba', 0)*1000:.1f} mV/dec, βc = {best.get('bc', 0)*1000:.1f} mV/dec
+**Primary passivation** (film coverage θ₁):
+```
+θ₁(E) = sigmoid(k₁ · (E − Epp))
+i_after_pass = i_active · (1−θ₁) + ipass · θ₁
+```
+- Below Epp: θ₁ ≈ 0 → pure Tafel kinetics
+- At Epp: θ₁ transitions → produces the **active dissolution peak** ("nose")
+- Above Epp: θ₁ ≈ 1 → current drops to ipass = **{p['ipass']:.3e}** A/cm²
+- k₁ = **{p['k_pass']:.1f}** V⁻¹ controls sharpness of the peak
+
+**Transpassive dissolution** (above Eb):
+```
+i_tp = a_tp · exp(b_tp · (E − Eb)) · sigmoid(E − Eb)
+```
+Eb = **{p['Eb']:.3f}** V
+
+**Secondary passivation** (film coverage θ₂):
+```
+θ₂(E) = sigmoid(k₂ · (E − Esp))
+i_total_anodic = (i_after_pass + i_tp) · (1−θ₂) + ipass₂ · θ₂
+```
+Esp = **{p['Esp']:.3f}** V, ipass₂ = **{p['ipass2']:.3e}** A/cm²
+
+**Net current:** `i_net = i_total_anodic − i_cathodic`
 """)
 
+    # ── Fitting log ─────────────────────────────────────
+    with st.expander("🪵 Optimization log"):
+        for msg in opt.log:
+            st.markdown(f"- {msg}")
+
+    # ── Downloads ───────────────────────────────────────
+    c_dl1, c_dl2 = st.columns(2)
+    with c_dl1:
+        df_csv = build_csv(best_p, reg, ew, rho, ct, r2_log, diags)
+        st.download_button("⬇️ Results + Diagnostics (CSV)",
+                           df_csv.to_csv(index=False).encode(),
+                           "tafel_results.csv", "text/csv", use_container_width=True)
+    with c_dl2:
+        df_d = pd.DataFrame({"E_V": E, "i_Acm2": i_dens, "log_abs_i": safe_log(i_dens)})
+        st.download_button("⬇️ Processed data (CSV)",
+                           df_d.to_csv(index=False).encode(),
+                           "tafel_data.csv", "text/csv", use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# APP ENTRY
+# ═══════════════════════════════════════════════════════════════
 
 def main():
     st.markdown("""
-    <div style="background:linear-gradient(135deg,#1e1e2e,#181825);
-                border:1px solid #313244; border-radius:12px;
-                padding:20px 28px; margin-bottom:20px;">
-      <h1 style="margin:0;color:#cdd6f4;font-size:26px;">⚡ Tafel Fitting Tool v3</h1>
-      <p style="margin:4px 0 0;color:#6c7086;font-size:13px;">
-        Global multi-region model · Fits entire curve (active + passive + transpassive + diffusion)
+    <div style="background:linear-gradient(135deg,#1e1e2e,#131320);
+                border:1px solid #313244;border-radius:12px;padding:20px 28px;margin-bottom:20px">
+      <h1 style="margin:0;color:#cdd6f4;font-size:26px">⚡ Tafel Fitting Tool v4</h1>
+      <p style="margin:4px 0 0;color:#6c7086;font-size:13px">
+        Global multi-region model · Film-coverage physics · All curve types · Data diagnostics
       </p>
     </div>""", unsafe_allow_html=True)
 
@@ -1434,51 +1400,45 @@ def main():
         area = st.number_input("Electrode area (cm²)", 0.001, 100.0, 1.0, 0.01)
         mat = st.selectbox("Material", list(MATERIALS.keys()))
         ew0, rho0 = MATERIALS[mat]
-        if mat == "Custom":
-            ew = st.number_input("EW (g/eq)", 1.0, 300.0, ew0)
-            rho = st.number_input("ρ (g/cm³)", 0.5, 25.0, rho0)
-        else:
-            ew, rho = ew0, rho0
+        ew, rho = (st.number_input("EW", 1.0, 300.0, ew0),
+                   st.number_input("ρ", 0.5, 25.0, rho0)) if mat == "Custom" else (ew0, rho0)
 
         st.divider()
-        st.markdown("""
-        <div style="font-size:11px; color:#a6adc8; line-height:2.0;">
-        <b style="color:#89b4fa;">Global model equation:</b><br>
-        i = i_anodic − i_cathodic + i_transpassive<br><br>
-        🟡 <b>Anodic</b>: BV × passive saturation<br>
-        🟣 <b>Cathodic</b>: BV × diffusion saturation<br>
-        🟠 <b>Transpassive</b>: exponential above Eb<br><br>
-        One model · one fit · entire curve
+        st.markdown("""<div style="font-size:11px;color:#a6adc8;line-height:2.0">
+        <b style="color:#89b4fa">Curve types auto-detected:</b><br>
+        🟡 Active only<br>🔵 Active + diffusion-limited<br>
+        🟢 Active → passive (with peak)<br>🟠 + transpassive<br>
+        🟣 + secondary passivity<br>🔴 Pitting breakdown<br>
+        🔀 Full multi-region
         </div>""", unsafe_allow_html=True)
 
-    uploaded = st.file_uploader("Drop your polarization data", type=["csv","txt","xlsx","xls"])
+    uploaded = st.file_uploader("Upload polarization data", type=["csv","txt","xlsx","xls"])
 
     if uploaded is None:
         c1, c2, c3 = st.columns([1, 2, 1])
         with c2:
             st.markdown("<br>", unsafe_allow_html=True)
-            demo_choice = st.selectbox("Or try a demo", [
-                "Full curve (limiting + passive + breakdown)",
-                "Active/Tafel only",
-                "With passive region only",
-                "Diffusion-limited cathodic"])
+            demo = st.selectbox("Or try a demo", [
+                "Active only", "Diffusion-limited cathodic",
+                "Active → Passive", "Passive + Transpassive",
+                "Passive + Transpassive + Pitting",
+                "Full: Passive + Transpassive + Secondary Passivity"])
             if st.button("▶  Run demo", use_container_width=True, type="primary"):
-                st.session_state["demo"] = demo_choice
+                st.session_state["demo"] = demo
             st.markdown("""<br>
-            <div style="background:#1e1e2e;border:1px solid #313244;border-radius:10px;padding:16px 20px;">
-            <b style="color:#89b4fa;">What's new in v3 — Global Fit</b><br><br>
-            <span style="color:#a6adc8;font-size:13px;">
-            ✓ <b>Single model fits the ENTIRE curve</b> — no separate local fits<br>
-            ✓ Physics-based: BV + passive saturation + diffusion limit + transpassive<br>
-            ✓ Fit line overlays all regions (active, passive, transpassive)<br>
-            ✓ Component breakdown plot shows each current contribution<br>
-            ✓ 3-stage optimization: DE global → Nelder-Mead → TRF gradient<br>
-            ✓ Model equation display with all fitted parameters<br>
-            ✓ Residual plot across full potential range
+            <div style="background:#1e1e2e;border:1px solid #313244;border-radius:10px;padding:16px 20px">
+            <b style="color:#89b4fa">v4 — What's new</b><br><br>
+            <span style="color:#a6adc8;font-size:13px">
+            ✓ <b>Film-coverage model</b> — produces the active dissolution peak (nose)<br>
+            ✓ <b>Secondary passivity</b> support (θ₂ term)<br>
+            ✓ <b>Pitting detection</b> (sharp vs. gradual breakdown)<br>
+            ✓ <b>4-stage optimization</b>: DE → Dual Annealing → L-BFGS-B → Nelder-Mead<br>
+            ✓ <b>Data quality diagnostics</b> — explains WHY fit may be poor<br>
+            ✓ All params extracted for the specific curve type detected<br>
+            ✓ Component breakdown with film coverage visualization
             </span></div>""", unsafe_allow_html=True)
         return
 
-    # Process file
     with st.spinner("Reading…"):
         try: df = load_any_file(uploaded)
         except Exception as ex: st.error(f"Read error: {ex}"); return
@@ -1486,42 +1446,34 @@ def main():
         try: e_col, i_col, i_factor = auto_detect_columns(df)
         except Exception as ex: st.error(f"Column error: {ex}"); return
 
-    with st.expander(f"📋 Auto-detected: **{e_col}** · **{i_col}**", expanded=False):
+    with st.expander(f"📋 Detected: **{e_col}** · **{i_col}**", expanded=False):
         st.dataframe(df[[e_col, i_col]].head(10), use_container_width=True)
 
-    E_raw = df[e_col].values.astype(float)
-    i_raw = df[i_col].values.astype(float) * i_factor
-    ok = np.isfinite(E_raw) & np.isfinite(i_raw)
-    E_raw, i_raw = E_raw[ok], i_raw[ok]
-    idx = np.argsort(E_raw)
-    E_raw, i_raw = E_raw[idx], i_raw[idx]
-    i_dens = i_raw / area
-
-    process_and_display(E_raw, i_dens, area, ew, rho)
+    E = df[e_col].values.astype(float)
+    ir = df[i_col].values.astype(float) * i_factor
+    ok = np.isfinite(E) & np.isfinite(ir)
+    E, ir = E[ok], ir[ok]
+    idx = np.argsort(E); E, ir = E[idx], ir[idx]
+    process_data(E, ir / area, area, ew, rho)
 
 
 if __name__ == "__main__":
     if "demo" in st.session_state:
         st.markdown("""
-        <div style="background:linear-gradient(135deg,#1e1e2e,#181825);
-                    border:1px solid #313244; border-radius:12px;
-                    padding:20px 28px; margin-bottom:20px;">
-          <h1 style="margin:0;color:#cdd6f4;font-size:26px;">⚡ Tafel Fitting v3</h1>
-          <p style="margin:4px 0 0;color:#6c7086;font-size:13px;">Demo</p>
+        <div style="background:linear-gradient(135deg,#1e1e2e,#131320);
+                    border:1px solid #313244;border-radius:12px;padding:20px 28px;margin-bottom:20px">
+          <h1 style="margin:0;color:#cdd6f4;font-size:26px">⚡ Tafel v4</h1>
+          <p style="margin:4px 0 0;color:#6c7086;font-size:13px">Demo</p>
         </div>""", unsafe_allow_html=True)
         with st.sidebar:
-            st.markdown("### ⚙️ Settings")
-            area = st.number_input("Electrode area (cm²)", 0.001, 100.0, 1.0)
+            st.markdown("### ⚙️")
+            area = st.number_input("Area (cm²)", 0.001, 100.0, 1.0)
             mat = st.selectbox("Material", list(MATERIALS.keys()))
             ew, rho = MATERIALS[mat]
-            if mat == "Custom":
-                ew = st.number_input("EW", 1.0, 300.0, ew)
-                rho = st.number_input("ρ", 0.5, 25.0, rho)
-            if st.button("← Back"):
-                del st.session_state["demo"]; st.rerun()
+            if st.button("← Back"): del st.session_state["demo"]; st.rerun()
 
-        E_d, i_d = run_demo(st.session_state["demo"])
-        st.info(f"🧪 Demo: **{st.session_state['demo']}**")
-        process_and_display(E_d, i_d / area, area, ew, rho)
+        E_d, i_d = make_demo(st.session_state["demo"])
+        st.info(f"🧪 **{st.session_state['demo']}**")
+        process_data(E_d, i_d / area, area, ew, rho)
     else:
         main()
