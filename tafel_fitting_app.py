@@ -1,5 +1,5 @@
 """
-Tafel Fitting Tool — v4: Comprehensive Global Electrochemical Model
+Tafel Fitting Tool : Comprehensive Global Electrochemical Model
 ====================================================================
 Fast global fit (<30s) across ALL electrochemically possible curve types.
 Uses reduced-parameter optimization: only optimizes parameters relevant
