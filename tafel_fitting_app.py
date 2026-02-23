@@ -815,7 +815,7 @@ Epp = {p['Epp']:.4f} V, ipass = {p['ipass']:.3e}
 def main():
     st.markdown("""<div style="background:linear-gradient(135deg,#1e1e2e,#131320);
         border:1px solid #313244;border-radius:12px;padding:20px 28px;margin-bottom:20px">
-      <h1 style="margin:0;color:#cdd6f4;font-size:26px">⚡ Tafel Fitting Tool v5</h1>
+      <h1 style="margin:0;color:#cdd6f4;font-size:26px">⚡ Tafel Fitting Tool</h1>
       <p style="margin:4px 0 0;color:#6c7086;font-size:13px">
         Dual-cathodic global model · Film-coverage physics · All curve types · Fast · Diagnostics
       </p></div>""",unsafe_allow_html=True)
