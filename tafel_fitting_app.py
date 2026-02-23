@@ -907,9 +907,6 @@ MATS={"Carbon Steel / Iron":(27.92,7.87),"304 Stainless Steel":(25.10,7.90),
 
 def process(E_full, i_full, area, ew, rho, cap_cfg_ui, fit_rs_ui, rs_bounds, loss_cfg_ui,
             speed_mode, max_fit_points, show_components, use_full_fit, escalate_r2, restarts, jitter):
-    # Book-keeping for logs
-    optA = None; optB = None; optC = None; optRef = None; optRef2 = None
-
     # Capacitive current vector (full) from UI
     if cap_cfg_ui.get("include", False):
         sgn = scan_direction_sign(E_full)
@@ -935,8 +932,8 @@ def process(E_full, i_full, area, ew, rho, cap_cfg_ui, fit_rs_ui, rs_bounds, los
 
     # Optimizer configs from speed mode
     if speed_mode == "Fast":
-        opt_cfg_A = {"use_de": False, "lbfgs_maxiter": 1500, "use_nm": False,
-                     "restarts": restarts, "jitter": jitter}
+        opt_cfg_A = {"use_de": False, "lbfgs_maxiter": 1500, "use inline": False,
+                     "use_nm": False, "restarts": restarts, "jitter": jitter}
     elif speed_mode == "Balanced":
         opt_cfg_A = {"use_de": True, "de_pop": 10, "de_iter": 260,
                      "lbfgs_maxiter": 1800, "use_nm": False,
@@ -954,10 +951,7 @@ def process(E_full, i_full, area, ew, rho, cap_cfg_ui, fit_rs_ui, rs_bounds, los
     # Stage B: Thinned/full refine with UI Rs/Cdl options
     prog.progress(55,text="Stage B: refine with UI Rs/Cdl...")
     fit_rs_B = fit_rs_ui
-    if use_full_fit:
-        i_cap_fit_B = i_cap_vec_full if cap_cfg_ui.get("include", False) else np.zeros_like(E_fit)
-    else:
-        i_cap_fit_B = (i_cap_vec_full[idx_fit] if cap_cfg_ui.get("include", False) else np.zeros_like(E_fit))
+    i_cap_fit_B = (i_cap_vec_full if use_full_fit else i_cap_vec_full[idx_fit]) if cap_cfg_ui.get("include", False) else np.zeros_like(E_fit)
     opt_cfg_B = opt_cfg_A.copy()
     optB=Optimizer(E_fit,i_fit,reg,bpA,i_cap_fit_B,fit_rs_B,rs_bounds,loss_cfg_ui,opt_cfg_B)
     bpB,rvB=optB.run()
@@ -979,7 +973,7 @@ def process(E_full, i_full, area, ew, rho, cap_cfg_ui, fit_rs_ui, rs_bounds, los
         optC=Optimizer(E_fit2,i_fit2,reg,bpB,i_cap_fit2,fit_rs_ui,rs_bounds,loss_cfg_ui,opt_cfg_C)
         bpC,rvC=optC.run()
         if rvC > rvB:
-            bpB, rvB = bpC, rvC
+            bpB, rvB, optB = bpC, rvC, optC
 
     # Stage D: Final full-data refine (pure log L2) for maximum R²
     prog.progress(90,text="Stage D: final full-data refine...")
@@ -990,18 +984,15 @@ def process(E_full, i_full, area, ew, rho, cap_cfg_ui, fit_rs_ui, rs_bounds, los
     # If UI enables Rs/Cdl, short refine with them enabled
     if fit_rs_ui or cap_cfg_ui.get("include", False):
         i_cap_vec_use = i_cap_vec_full if cap_cfg_ui.get("include", False) else np.zeros_like(E_full)
-        optRef2=Optimizer(E_full,i_full,reg,bp,i_cap_vec_use,fit_rs_ui,rs_bounds,{"type":"log_l2"},
-                          {"use_de":False,"lbfgs_maxiter":2000,"use_nm":False,"restarts":0,"jitter":0.0})
+        optRef2=Optimizer(E_full,i_full,reg,bp,i_cap_vec_use,fit_rs_ui,rs_bounds,{"type":"log_l2"}, {"use_de":False,"lbfgs_maxiter":2000,"use_nm":False,"restarts":0,"jitter":0.0})
         bp,rv=optRef2.run()
 
+    # Diagnostics on full data
     prog.progress(100,text="Done!"); prog.empty()
-
-    # Diagnostics on full data (with UI Cdl)
-    i_cap_for_diag = i_cap_vec_full if cap_cfg_ui.get("include", False) else np.zeros_like(E_full)
-    diags=diagnose(E_full,i_full,reg,bp,rv,i_cap_for_diag)
+    diags=diagnose(E_full,i_full,reg,bp,rv, i_cap_vec_full if cap_cfg_ui.get("include", False) else np.zeros_like(E_full))
 
     st.markdown("---")
-    st.plotly_chart(plot_main(E_full,i_full,bp,reg,ct,i_cap_for_diag),use_container_width=True)
+    st.plotly_chart(plot_main(E_full,i_full,bp,reg,ct, i_cap_vec_full if cap_cfg_ui.get("include", False) else np.zeros_like(E_full)),use_container_width=True)
     c1,c2=st.columns(2)
     with c1:
         if show_components:
@@ -1010,8 +1001,10 @@ def process(E_full, i_full, area, ew, rho, cap_cfg_ui, fit_rs_ui, rs_bounds, los
         else:
             st.info("Component plot disabled.")
     with c2:
-        i_cap_for_plot = i_cap_vec_full if cap_cfg_ui.get("include", False) else np.zeros_like(E_full)
-        fr=plot_res(E_full,i_full,bp,i_cap_for_plot)
+        fr=plot_res(E_full,i_full,bp, i guided := (i_cap_vec_full if cap_cfg_ui.get('include', False) else np.zeros_like(E_full)))
+        # Fallback if variable name issue:
+        if fr is None:
+            fr=plot_res(E_full,i_full,bp, i_cap_vec_full if cap_cfg_ui.get("include", False) else np.zeros_like(E_full))
         if fr: st.plotly_chart(fr,use_container_width=True)
 
     st.markdown("---"); show_p(bp,reg,ew,rho,ct,rv,cap_cfg_ui)
@@ -1040,11 +1033,7 @@ Ohmic drop: `E_eff = E − Rs·i_net` (self-consistent iterations)
 Fitted: Ecorr={p['Ecorr']:.4f} V, icorr={p['icorr']:.3e}, βa={p['ba']*1000:.1f}, βc₁={p['bc1']*1000:.1f} mV/dec, Rs={p['Rs']:.3f} Ω·cm²
 """)
     with st.expander("Optimization Log"):
-        logs = []
-        for obj in [optA, optB, optC, optRef, 'optRef2' in locals() and optRef2 or None]:
-            if obj is not None:
-                logs += obj.log
-        for msg in logs:
+        for msg in optA.log + optB.log + (optRef.log if 'optRef' in locals() else []):
             st.markdown(f"- {msg}")
     cd1,cd2=st.columns(2)
     with cd1:
