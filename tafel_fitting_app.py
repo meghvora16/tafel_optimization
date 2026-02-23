@@ -117,6 +117,7 @@ def scan_direction_sign(E):
     dE = np.diff(E)
     s = np.zeros_like(E, dtype=float)
     sgn = np.sign(dE)
+    # Replace zeros by previous non-zero
     last = 1.0
     for k in range(len(E)-1):
         if sgn[k] == 0:
@@ -160,15 +161,7 @@ def gmodel(E, p, i_cap=None, n_it=4):
     Rs = max(p[16], 0.0)
 
     E = np.asarray(E, dtype=float)
-    if i_cap is None:
-        i_cap_arr = np.zeros_like(E)
-    else:
-        i_cap_arr = np.asarray(i_cap, dtype=float)
-        if i_cap_arr.shape != E.shape:
-            if i_cap_arr.size == 1:
-                i_cap_arr = np.full_like(E, float(i_cap_arr))
-            else:
-                i_cap_arr = np.zeros_like(E)
+    i_cap = np.zeros_like(E) if i_cap is None else i_cap.astype(float)
 
     # Initialize
     E_eff = E.copy()
@@ -199,7 +192,7 @@ def gmodel(E, p, i_cap=None, n_it=4):
         i_an = (i_p1 + i_tp)*(1.0 - t2) + ipass2*t2
 
         # Net faradaic + capacitive
-        i_net = i_an - (i_c1 + i_c2) + i_cap_arr
+        i_net = i_an - (i_c1 + i_c2) + i_cap
 
         # Update effective potential with ohmic drop
         if Rs > 0:
@@ -208,7 +201,7 @@ def gmodel(E, p, i_cap=None, n_it=4):
     return i_net
 
 def gcomp(E, p, i_cap=None):
-    """Return components with ohmic drop and optional capacitive current; robust to i_cap shape."""
+    """Return components with ohmic drop and optional capacitive current."""
     Ecorr,icorr,ba,bc1,iL = p[0:5]
     i0_c2,bc2 = p[5:7]
     Epp,k_pass,ipass = p[7:10]
@@ -217,19 +210,8 @@ def gcomp(E, p, i_cap=None):
     Rs = max(p[16], 0.0)
 
     E = np.asarray(E, dtype=float)
+    i_cap = np.zeros_like(E) if i_cap is None else i_cap.astype(float)
 
-    # Ensure i_cap matches E length (or is broadcastable)
-    if i_cap is None:
-        i_cap_arr = np.zeros_like(E)
-    else:
-        i_cap_arr = np.asarray(i_cap, dtype=float)
-        if i_cap_arr.shape != E.shape:
-            if i_cap_arr.size == 1:
-                i_cap_arr = np.full_like(E, float(i_cap_arr))
-            else:
-                i_cap_arr = np.zeros_like(E)
-
-    # Self-consistency for ohmic drop
     E_eff = E.copy()
     for _ in range(4):
         eta = E_eff - Ecorr
@@ -240,7 +222,7 @@ def gcomp(E, p, i_cap=None):
         t1 = sig(E_eff - Epp, k_pass); i_p1 = i_act*(1.0 - t1) + ipass*t1
         i_tp = a_tp*np.exp(np.clip(b_tp*(E_eff - Eb), -50, 50))*sig(E_eff - Eb, 40.0)
         t2 = sig(E_eff - Esp, k_sp); i_an = (i_p1 + i_tp)*(1.0 - t2) + ipass2*t2
-        i_net = i_an - (i_c1 + i_c2) + i_cap_arr
+        i_net = i_an - (i_c1 + i_c2) + i_cap
         if Rs > 0:
             E_eff = E - i_net * Rs
 
@@ -275,7 +257,7 @@ class CT:
                [0,1,2,3,4,5,6,7,8,9,10,11,12]),
         "PTS":("Full: + Secondary Passivity",
                "Active→passive→transpassive→secondary passivity.",
-               list(range(16))),  # Rs handled separately
+               list(range(16))),  # indices up to ipass2; Rs handled separately
         "PP": ("Passive + Pitting",
                "Passive with sharp pitting breakdown at Epit.",
                [0,1,2,3,4,5,6,7,8,9,10,11,12]),
@@ -636,7 +618,7 @@ class Optimizer:
 # ================================================================
 # DIAGNOSTICS
 # ================================================================
-def diagnose(E, i, reg, bp, rv, i_cap_vec):
+def diagnose(E, i, reg, bp, rv):
     issues=[]; ai=np.abs(i); lg=slog(i); n=len(E); Ec=reg["Ecorr"]
     # Noise
     if n>20:
@@ -654,19 +636,15 @@ def diagnose(E, i, reg, bp, rv, i_cap_vec):
     if Er<0.3: issues.append(("Narrow scan",f"{Er*1000:.0f} mV. May miss regions.","w"))
     if n/max(Er,0.01)<50: issues.append(("Low density",f"{n/max(Er,0.01):.0f} pts/V.","w"))
     if np.sum(np.abs(E-Ec)<0.05)<5: issues.append(("Sparse near Ecorr","<5 pts within ±50 mV.","w"))
-    # Residuals vs model including capacitive term
+    # Residuals
     if bp is not None:
-        res=lg-slog(gmodel(E,bp, i_cap=i_cap_vec))
+        res=lg-slog(gmodel(E,bp))
         if n>10:
             nruns=np.sum(np.abs(np.diff(np.sign(res)))>0)+1
             if nruns<n*0.25: issues.append(("Systematic misfit",
                 f"{nruns} sign changes (expect ~{n//2}). Model may miss a feature.","w"))
-        masks = [
-            ("near Ecorr",np.abs(E-Ec)<0.05),
-            ("cathodic",E<Ec-0.1),
-            ("passive",(E>reg.get("Epp",99))&(E<reg.get("Eb",E[-1])) if bp is not None else np.zeros_like(E,dtype=bool))
-        ]
-        for name,mask in masks:
+        for name,mask in [("near Ecorr",np.abs(E-Ec)<0.05),
+            ("cathodic",E<Ec-0.1),("passive",(E>reg.get("Epp",99))&(E<reg.get("Eb",E[-1])) if bp is not None else np.zeros_like(E,dtype=bool))]:
             if mask.sum()>3:
                 rmse=np.sqrt(np.mean((res[mask])**2))
                 if rmse>0.5: issues.append((f"Poor fit: {name}",f"RMSE={rmse:.3f} dec.","w"))
@@ -707,7 +685,7 @@ def plot_main(E, i, bp, reg, ct, i_cap_vec):
     if bp is not None:
         Em=np.linspace(np.min(E),np.max(E),1000)
         try:
-            im=gmodel(Em,bp)  # faradaic-only curve for baseline
+            im=gmodel(Em,bp)  # plot faradaic-only curve for baseline
             rv=r2(lg,slog(gmodel(E,bp, i_cap=i_cap_vec)))
             fig.add_trace(go.Scatter(x=Em,y=slog(im),mode="lines",
                 name=f"Global Fit (faradaic)  R²(log)={rv:.4f}",line=dict(color=CL["fit"],width=3)))
@@ -725,10 +703,7 @@ def plot_main(E, i, bp, reg, ct, i_cap_vec):
 
 def plot_comp(E, bp, ct, i_cap_vec):
     if bp is None: return None
-    Em=np.linspace(np.min(E),np.max(E),800)
-    # Component plot uses faradaic-only (no capacitive current) for clarity
-    c=gcomp(Em,bp)  # no i_cap passed -> zero vector used
-    fig=go.Figure()
+    Em=np.linspace(np.min(E),np.max(E),800); c=gcomp(Em,bp, i_cap=i_cap_vec*0.0); fig=go.Figure()
     fig.add_trace(go.Scatter(x=Em,y=slog(c["ic1"]),mode="lines",name="O₂ cathodic",
         line=dict(color=CL["cathodic"],width=1.5,dash="dot")))
     fig.add_trace(go.Scatter(x=Em,y=slog(c["ic2"]),mode="lines",name="H₂ cathodic",
@@ -863,7 +838,7 @@ def process(E, i_d, area, ew, rho, cap_cfg, fit_rs, rs_bounds, loss_cfg):
     bp,rv=opt.run()
 
     prog.progress(90,text="Diagnostics...")
-    diags=diagnose(E,i_d,reg,bp,rv,i_cap_vec)
+    diags=diagnose(E,i_d,reg,bp,rv)
     prog.progress(100,text="Done!"); prog.empty()
 
     st.markdown("---")
@@ -887,16 +862,16 @@ def process(E, i_d, area, ew, rho, cap_cfg, fit_rs, rs_bounds, loss_cfg):
             st.markdown(f"""
 **Dual-Cathodic Film-Coverage Model (with Rs)**
 
-`i_net = i_anodic_total − (i_O₂ + i_H₂) + i_cap`
+i_net = i_anodic_total − (i_O₂ + i_H₂) + i_cap
 
-- **O₂ (diff.-limited):** `i_O₂ = i_kin / (1 + i_kin / iL)`, where `i_kin = icorr·exp(−2.303η/βc₁)`
-- **H₂ (activation):** `i_H₂ = i₀,c₂·exp(−2.303η/βc₂)`
-- **Active anodic:** `i_act = icorr·exp( 2.303η/βa )`
-- **Primary passivation:** `θ₁ = σ(k₁·(E−Epp))`, `i = i_act·(1−θ₁) + ipass·θ₁`
-- **Transpassive:** `i_tp = a_tp·exp(b_tp·(E−Eb))·σ(E−Eb)`
-- **Secondary passivation:** `θ₂ = σ(k₂·(E−Esp))`, `i_an = (i_p1+i_tp)·(1−θ₂) + ipass₂·θ₂`
+- O₂ (diff.-limited): i_O₂ = i_kin / (1 + i_kin / iL), where i_kin = icorr·exp(−2.303η/βc₁)
+- H₂ (activation): i_H₂ = i₀,c₂·exp(−2.303η/βc₂)
+- Active anodic: i_act = icorr·exp( 2.303η/βa )
+- Primary passivation: θ₁ = σ(k₁·(E−Epp)), i = i_act·(1−θ₁) + ipass·θ₁
+- Transpassive: i_tp = a_tp·exp(b_tp·(E−Eb))·σ(E−Eb)
+- Secondary passivation: θ₂ = σ(k₂·(E−Esp)), i_an = (i_p1+i_tp)·(1−θ₂) + ipass₂·θ₂
 
-Ohmic drop: `E_eff = E − Rs·i_net` (solved self-consistently)
+Ohmic drop: E_eff = E − Rs·i_net (solved self-consistently)
 
 Fitted: Ecorr={p['Ecorr']:.4f} V, icorr={p['icorr']:.3e}, βa={p['ba']*1000:.1f}, βc₁={p['bc1']*1000:.1f} mV/dec, Rs={p['Rs']:.3f} Ω·cm²
 """)
