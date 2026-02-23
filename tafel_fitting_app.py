@@ -1,10 +1,10 @@
-# ⚡ Tafel Fitting Tool — Global Polarization Curve Fitter (with Rs & Capacitive Current)
+# ⚡ Tafel Fitting Tool — Global Polarization Curve Fitter (stable baseline)
 # - Dual cathodic (O2 diffusion-limited + H2 evolution)
 # - Film-coverage passivation, transpassive, secondary passivity
 # - Optional uncompensated resistance Rs (ohmic drop)
-# - Optional capacitive current i_cap = Cdl * ν (with automatic scan-direction detection)
+# - Optional capacitive current i_cap = Cdl * ν (with scan-direction detection)
 # - Robust loss options: Log L2, Hybrid (log+linear), Huber (log)
-# - Adaptive parameter masking by detected curve type
+# - Standard optimizer: DE → L-BFGS-B → Nelder–Mead
 # - Demo fitting removed
 
 import streamlit as st
@@ -36,7 +36,7 @@ section[data-testid="stFileUploadDropzone"]{background:#1e1e2e!important;
 .bg{background:#1c3a2f;color:#a6e3a1;border:1px solid #a6e3a1}
 .bb{background:#1a2a3f;color:#89b4fa;border:1px solid #89b4fa}
 .by{background:#3a3020;color:#f9e2af;border:1px solid #f9e2af}
-.br{background:#3a1a20;color:#f38ba8;border:1px solid #f38ba8}
+.br{background:#1a1a2e;color:#f38ba8;border:1px solid #f38ba8}
 .bp{background:#2a1a3a;color:#cba6f7;border:1px solid #cba6f7}
 .bx{background:#1e1e2e;border-radius:0 8px 8px 0;padding:8px 14px;margin:6px 0;font-size:12px}
 .bok{border-left:4px solid #a6e3a1;color:#cdd6f4}
@@ -117,7 +117,6 @@ def scan_direction_sign(E):
     dE = np.diff(E)
     s = np.zeros_like(E, dtype=float)
     sgn = np.sign(dE)
-    # Replace zeros by previous non-zero
     last = 1.0
     for k in range(len(E)-1):
         if sgn[k] == 0:
@@ -132,15 +131,6 @@ def scan_direction_sign(E):
 # ================================================================
 # GLOBAL MODEL  (17 parameters: + Rs)
 # ================================================================
-# p = [Ecorr, icorr, ba, bc1, iL,     — core + O2 cathodic
-#      i0_c2, bc2,                     — H2 evolution
-#      Epp, k_pass, ipass,             — primary passivation
-#      Eb, a_tp, b_tp,                 — transpassive
-#      Esp, k_sp, ipass2,              — secondary passivity
-#      Rs]                             — uncompensated resistance (Ω·cm²)
-#
-# LOG_I indexes are currents; Rs is not log-transformed.
-
 PN = ["Ecorr","icorr","ba","bc1","iL",
       "i0_c2","bc2",
       "Epp","k_pass","ipass",
@@ -150,7 +140,18 @@ PN = ["Ecorr","icorr","ba","bc1","iL",
 NP = 17
 LOG_I = {1,4,5,9,11,15}  # currents (icorr, iL, i0_c2, ipass, a_tp, ipass2)
 
-def gmodel(E, p, i_cap=None, n_it=4):
+def _prepare_i_cap(E, i_cap):
+    E = np.asarray(E, dtype=float)
+    if i_cap is None:
+        return np.zeros_like(E)
+    arr = np.asarray(i_cap, dtype=float)
+    if arr.shape != E.shape:
+        if arr.size == 1:
+            return np.full_like(E, float(arr))
+        return np.zeros_like(E)
+    return arr
+
+def gmodel(E, p, i_cap=None, n_it=None):
     """Global polarization model with ohmic drop and optional capacitive current.
     Returns net current density i_net (A/cm²)."""
     Ecorr,icorr,ba,bc1,iL = p[0],p[1],p[2],p[3],p[4]
@@ -161,13 +162,16 @@ def gmodel(E, p, i_cap=None, n_it=4):
     Rs = max(p[16], 0.0)
 
     E = np.asarray(E, dtype=float)
-    i_cap = np.zeros_like(E) if i_cap is None else i_cap.astype(float)
+    i_cap_arr = _prepare_i_cap(E, i_cap)
 
-    # Initialize
+    # iterations: default 4; increase if Rs significant
+    if n_it is None:
+        n_it = 1 if Rs <= 1e-4 else 4
+
     E_eff = E.copy()
     i_net = np.zeros_like(E)
 
-    for _ in range(max(1, int(n_it))):
+    for _ in range(n_it):
         eta = E_eff - Ecorr
 
         # Cathodic 1: O2 reduction (diffusion-limited)
@@ -192,7 +196,7 @@ def gmodel(E, p, i_cap=None, n_it=4):
         i_an = (i_p1 + i_tp)*(1.0 - t2) + ipass2*t2
 
         # Net faradaic + capacitive
-        i_net = i_an - (i_c1 + i_c2) + i_cap
+        i_net = i_an - (i_c1 + i_c2) + i_cap_arr
 
         # Update effective potential with ohmic drop
         if Rs > 0:
@@ -201,7 +205,7 @@ def gmodel(E, p, i_cap=None, n_it=4):
     return i_net
 
 def gcomp(E, p, i_cap=None):
-    """Return components with ohmic drop and optional capacitive current."""
+    """Return components with ohmic drop and optional capacitive current (robust to i_cap shape)."""
     Ecorr,icorr,ba,bc1,iL = p[0:5]
     i0_c2,bc2 = p[5:7]
     Epp,k_pass,ipass = p[7:10]
@@ -210,10 +214,11 @@ def gcomp(E, p, i_cap=None):
     Rs = max(p[16], 0.0)
 
     E = np.asarray(E, dtype=float)
-    i_cap = np.zeros_like(E) if i_cap is None else i_cap.astype(float)
+    i_cap_arr = _prepare_i_cap(E, i_cap)
+    n_it = 1 if Rs <= 1e-4 else 4
 
     E_eff = E.copy()
-    for _ in range(4):
+    for _ in range(n_it):
         eta = E_eff - Ecorr
         ic1k = icorr*np.exp(np.clip(-2.303*eta/np.maximum(bc1,1e-12), -50, 50))
         i_c1 = ic1k/(1.0 + np.where(iL>0, ic1k/np.maximum(iL,1e-20), 0.0))
@@ -222,7 +227,7 @@ def gcomp(E, p, i_cap=None):
         t1 = sig(E_eff - Epp, k_pass); i_p1 = i_act*(1.0 - t1) + ipass*t1
         i_tp = a_tp*np.exp(np.clip(b_tp*(E_eff - Eb), -50, 50))*sig(E_eff - Eb, 40.0)
         t2 = sig(E_eff - Esp, k_sp); i_an = (i_p1 + i_tp)*(1.0 - t2) + ipass2*t2
-        i_net = i_an - (i_c1 + i_c2) + i_cap
+        i_net = i_an - (i_c1 + i_c2) + i_cap_arr
         if Rs > 0:
             E_eff = E - i_net * Rs
 
@@ -257,7 +262,7 @@ class CT:
                [0,1,2,3,4,5,6,7,8,9,10,11,12]),
         "PTS":("Full: + Secondary Passivity",
                "Active→passive→transpassive→secondary passivity.",
-               list(range(16))),  # indices up to ipass2; Rs handled separately
+               list(range(16))),  # Rs optional
         "PP": ("Passive + Pitting",
                "Passive with sharp pitting breakdown at Epit.",
                [0,1,2,3,4,5,6,7,8,9,10,11,12]),
@@ -277,7 +282,6 @@ class CT:
 # REGION DETECTION (uses potential-sorted copy for stability)
 # ================================================================
 def detect(E, i):
-    # Work on a sorted-by-E copy for robust gradients
     idx_sort = np.argsort(E)
     Es = E[idx_sort]; is_ = i[idx_sort]
     reg={}; n=len(Es); ai=np.abs(is_)
@@ -430,8 +434,7 @@ def init_guess(E, i, reg):
         else: continue
         break
 
-    Emax=float(np.max(E)); Emin=float(np.min(E))
-    # Rs initial guess = 0
+    Emax=float(np.max(E))
     return np.array([
         Ec,                                         # 0  Ecorr
         ic0,                                        # 1  icorr
@@ -478,10 +481,8 @@ class Optimizer:
 
     def _bounds(self, rs_bounds):
         p=self.pfull; reg=self.reg; Ec=p[0]; ic=max(p[1],1e-14)
-        Emax=float(np.max(self.E)); Emin=float(np.min(self.E))
-        rs_lo, rs_hi = rs_bounds
+        Emax=float(np.max(self.E)); rs_lo, rs_hi = rs_bounds
 
-        # Full bounds vector length NP
         self.lo=np.array([
             Ec-0.20, max(ic*1e-4,1e-15), 0.010, 0.010,
             max(reg.get("iL",1e-6)*0.01,1e-10),
@@ -492,7 +493,7 @@ class Optimizer:
             max(p[11]*1e-4 if "Eb" in reg else 1e-30,1e-30), 0.5,
             p[13]-0.25 if "p2" in reg else Emax+10,
             5.0, max(p[15]*0.01 if "p2" in reg else 1e-14,1e-14),
-            max(rs_lo, 0.0)  # Rs
+            max(rs_lo, 0.0)
         ])
         self.hi=np.array([
             Ec+0.20, min(ic*1e4,1e0), 0.500, 0.500,
@@ -504,7 +505,7 @@ class Optimizer:
             max(p[11]*1e4 if "Eb" in reg else 1e-20,1e-10), 40.0,
             p[13]+0.25 if "p2" in reg else Emax+25,
             200.0, max(p[15]*100 if "p2" in reg else 1e-4,1e-4),
-            max(rs_hi, 0.0)  # Rs
+            max(rs_hi, 0.0)
         ])
         for j in range(NP):
             if self.lo[j]>=self.hi[j]:
@@ -522,7 +523,6 @@ class Optimizer:
                 if j in LOG_I else (self.lo[j],self.hi[j]) for j in self.fidx]
 
     def _loss(self, p):
-        # model
         try:
             im = gmodel(self.E, p, i_cap=self.i_cap_vec)
         except Exception:
@@ -585,8 +585,7 @@ class Optimizer:
             res=differential_evolution(self._obj,bnds,seed=42,maxiter=mi,tol=1e-12,
                 popsize=ps,mutation=(0.5,1.5),recombination=0.9,polish=False)
             self._up(res.x,f"DE ({time.time()-t1:.1f}s)")
-        except Exception as ex:
-            self.log.append(f"  DE err: {ex}")
+        except Exception as ex: self.log.append(f"  DE err: {ex}")
         # L-BFGS-B
         self.log.append("Stage 2: L-BFGS-B")
         try:
@@ -594,18 +593,15 @@ class Optimizer:
             r2v=minimize(self._obj,self._pack(self.best_p),method="L-BFGS-B",bounds=bnds,
                 options={"maxiter":20000,"ftol":1e-15,"gtol":1e-12})
             self._up(r2v.x,f"L-BFGS-B ({time.time()-t1:.1f}s)")
-        except Exception as ex:
-            self.log.append(f"  L-BFGS-B err: {ex}")
-        # Nelder-Mead
+        except Exception as ex: self.log.append(f"  L-BFGS-B err: {ex}")
+        # NM
         self.log.append("Stage 3: Nelder-Mead")
         try:
             t1=time.time()
             r3=minimize(self._obj,self._pack(self.best_p),method="Nelder-Mead",
                 options={"maxiter":15000,"xatol":1e-13,"fatol":1e-15,"adaptive":True})
             self._up(r3.x,f"NM ({time.time()-t1:.1f}s)")
-        except Exception as ex:
-            self.log.append(f"  NM err: {ex}")
-
+        except Exception as ex: self.log.append(f"  NM err: {ex}")
         dt=time.time()-t0
         try:
             rv=r2(self.ld,slog(gmodel(self.E,self.best_p, i_cap=self.i_cap_vec)))
@@ -644,9 +640,9 @@ def diagnose(E, i, reg, bp, rv):
             if nruns<n*0.25: issues.append(("Systematic misfit",
                 f"{nruns} sign changes (expect ~{n//2}). Model may miss a feature.","w"))
         for name,mask in [("near Ecorr",np.abs(E-Ec)<0.05),
-            ("cathodic",E<Ec-0.1),("passive",(E>reg.get("Epp",99))&(E<reg.get("Eb",E[-1])) if bp is not None else np.zeros_like(E,dtype=bool))]:
+            ("cathodic",E<Ec-0.1),("passive",(E>reg.get("Epp",99))&(E<reg.get("Eb",E[-1])))]:
             if mask.sum()>3:
-                rmse=np.sqrt(np.mean((res[mask])**2))
+                rmse=np.sqrt(np.mean(res[mask]**2))
                 if rmse>0.5: issues.append((f"Poor fit: {name}",f"RMSE={rmse:.3f} dec.","w"))
         if bp[1]>0.1: issues.append(("Very high icorr",f"{bp[1]:.2e} — check area/units.","e"))
         if bp[1]<1e-14: issues.append(("Very low icorr",f"{bp[1]:.2e}.","w"))
@@ -685,7 +681,7 @@ def plot_main(E, i, bp, reg, ct, i_cap_vec):
     if bp is not None:
         Em=np.linspace(np.min(E),np.max(E),1000)
         try:
-            im=gmodel(Em,bp)  # plot faradaic-only curve for baseline
+            im=gmodel(Em,bp)  # faradaic-only curve for baseline
             rv=r2(lg,slog(gmodel(E,bp, i_cap=i_cap_vec)))
             fig.add_trace(go.Scatter(x=Em,y=slog(im),mode="lines",
                 name=f"Global Fit (faradaic)  R²(log)={rv:.4f}",line=dict(color=CL["fit"],width=3)))
@@ -701,9 +697,11 @@ def plot_main(E, i, bp, reg, ct, i_cap_vec):
         height=540,margin=dict(l=70,r=20,t=50,b=60),hovermode="x unified")
     return fig
 
-def plot_comp(E, bp, ct, i_cap_vec):
+def plot_comp(E, bp, ct):
     if bp is None: return None
-    Em=np.linspace(np.min(E),np.max(E),800); c=gcomp(Em,bp, i_cap=i_cap_vec*0.0); fig=go.Figure()
+    Em=np.linspace(np.min(E),np.max(E),800)
+    c=gcomp(Em,bp)  # no i_cap passed → zero vector used internally
+    fig=go.Figure()
     fig.add_trace(go.Scatter(x=Em,y=slog(c["ic1"]),mode="lines",name="O₂ cathodic",
         line=dict(color=CL["cathodic"],width=1.5,dash="dot")))
     fig.add_trace(go.Scatter(x=Em,y=slog(c["ic2"]),mode="lines",name="H₂ cathodic",
@@ -776,7 +774,7 @@ def show_p(bp, reg, ew, rho, ct, rv, cap_cfg):
     clr={"A":"#f9e2af","AD":"#89dceb","AH":"#f5c2e7","P":"#a6e3a1","PD":"#94e2d5",
          "PT":"#fab387","PTS":"#cba6f7","PP":"#f38ba8","F":"#f5c2e7"}.get(ct,"#cdd6f4")
     st.markdown(f'<div class="tb"><div style="font-size:16px;font-weight:700;color:{clr}">{title}</div>'
-                f'<div style="font-size:12px;color:#a6adc8">{desc} ({nf} core free params; Rs optional)</div></div>',unsafe_allow_html=True)
+                f'<div style="font-size:12px;color:#a6adc8">{desc} ({nf} free params; Rs optional)</div></div>',unsafe_allow_html=True)
     c1,c2,c3,c4=st.columns(4)
     with c1:
         st.markdown('<div class="sh">Corrosion</div>',unsafe_allow_html=True)
@@ -819,33 +817,26 @@ MATS={"Carbon Steel / Iron":(27.92,7.87),"304 Stainless Steel":(25.10,7.90),
     "Nickel":(29.36,8.91),"Titanium":(11.99,4.51),"Zinc":(32.69,7.14),"Custom":(27.92,7.87)}
 
 def process(E, i_d, area, ew, rho, cap_cfg, fit_rs, rs_bounds, loss_cfg):
-    # Capacitive current vector
+    # Capacitive current vector (per data length)
     if cap_cfg.get("include", False):
         sgn = scan_direction_sign(E)
         i_cap_vec = cap_cfg["Cdl"] * cap_cfg["nu"] * sgn
     else:
         i_cap_vec = np.zeros_like(E)
 
-    # Detect using E-sorted copy
-    prog=st.progress(0,text="Detecting regions...")
-    reg=detect(E,i_d); ct=reg["ct"]
-    prog.progress(15,text="Initial estimates...")
-    p0=init_guess(E,i_d,reg)
-
-    # Prepare optimizer and run
+    # Detect regions and init
+    prog=st.progress(0,text="Detecting regions..."); reg=detect(E,i_d); ct=reg["ct"]
+    prog.progress(15,text="Initial estimates..."); p0=init_guess(E,i_d,reg)
     prog.progress(25,text=f"Optimizing ({CT.nfree(ct)}+{'Rs' if fit_rs else '0'} params)...")
-    opt=Optimizer(E,i_d,reg,p0,i_cap_vec,fit_rs,rs_bounds,loss_cfg)
-    bp,rv=opt.run()
-
-    prog.progress(90,text="Diagnostics...")
-    diags=diagnose(E,i_d,reg,bp,rv)
+    opt=Optimizer(E,i_d,reg,p0,i_cap_vec,fit_rs,rs_bounds,loss_cfg); bp,rv=opt.run()
+    prog.progress(90,text="Diagnostics..."); diags=diagnose(E,i_d,reg,bp,rv)
     prog.progress(100,text="Done!"); prog.empty()
 
     st.markdown("---")
     st.plotly_chart(plot_main(E,i_d,bp,reg,ct,i_cap_vec),use_container_width=True)
     c1,c2=st.columns(2)
     with c1:
-        fc=plot_comp(E,bp,ct,i_cap_vec)
+        fc=plot_comp(E,bp,ct)
         if fc: st.plotly_chart(fc,use_container_width=True)
     with c2:
         fr=plot_res(E,i_d,bp,i_cap_vec)
@@ -860,18 +851,18 @@ def process(E, i_d, area, ew, rho, cap_cfg, fit_rs, rs_bounds, loss_cfg):
         with st.expander("Model Equation"):
             p=dict(zip(PN,bp))
             st.markdown(f"""
-**Dual-Cathodic Film-Coverage Model (with Rs)**
+**Dual-Cathodic Film-Coverage Model (with optional Rs)**
 
-i_net = i_anodic_total − (i_O₂ + i_H₂) + i_cap
+`i_net = i_anodic_total − (i_O₂ + i_H₂) + i_cap`
 
-- O₂ (diff.-limited): i_O₂ = i_kin / (1 + i_kin / iL), where i_kin = icorr·exp(−2.303η/βc₁)
-- H₂ (activation): i_H₂ = i₀,c₂·exp(−2.303η/βc₂)
-- Active anodic: i_act = icorr·exp( 2.303η/βa )
-- Primary passivation: θ₁ = σ(k₁·(E−Epp)), i = i_act·(1−θ₁) + ipass·θ₁
-- Transpassive: i_tp = a_tp·exp(b_tp·(E−Eb))·σ(E−Eb)
-- Secondary passivation: θ₂ = σ(k₂·(E−Esp)), i_an = (i_p1+i_tp)·(1−θ₂) + ipass₂·θ₂
+- O₂ (diff.-limited): `i_O₂ = i_kin / (1 + i_kin / iL)`, where `i_kin = icorr·exp(−2.303η/βc₁)`
+- H₂ (activation): `i_H₂ = i₀,c₂·exp(−2.303η/βc₂)`
+- Active anodic: `i_act = icorr·exp( 2.303η/βa )`
+- Primary passivation: `θ₁ = σ(k₁·(E−Epp))`, `i = i_act·(1−θ₁) + ipass·θ₁`
+- Transpassive: `i_tp = a_tp·exp(b_tp·(E−Eb))·σ(E−Eb)`
+- Secondary passivation: `θ₂ = σ(k₂·(E−Esp))`, `i_an = (i_p1+i_tp)·(1−θ₂) + ipass₂·θ₂`
 
-Ohmic drop: E_eff = E − Rs·i_net (solved self-consistently)
+Ohmic drop: `E_eff = E − Rs·i_net` (solved self-consistently)
 
 Fitted: Ecorr={p['Ecorr']:.4f} V, icorr={p['icorr']:.3e}, βa={p['ba']*1000:.1f}, βc₁={p['bc1']*1000:.1f} mV/dec, Rs={p['Rs']:.3f} Ω·cm²
 """)
@@ -946,7 +937,7 @@ def main():
         st.markdown("""<div style="font-size:11px;color:#a6adc8;line-height:1.6">
         - Rs: self-consistent IR drop in the model.<br>
         - Cdl·ν: adds capacitive current with scan-direction detection.<br>
-        - Robust loss: reduce outlier influence or balance low/high |i|.
+        - Robust loss: reduce outlier influence or balance low/high |i|.<br>
         </div>""",unsafe_allow_html=True)
 
     up=st.file_uploader("Upload polarization data",type=["csv","txt","xlsx","xls"])
@@ -973,7 +964,6 @@ def main():
 
     # Loss configuration
     lt = loss_type.lower()
-    loss_cfg = {}
     if lt.startswith("log l2"):
         loss_cfg = {"type": "log_l2"}
     elif lt.startswith("hybrid"):
