@@ -1,11 +1,13 @@
-# ⚡ Tafel Fitting Tool — Global Polarization Curve Fitter (adaptive quality + speed, Rs & Capacitive Current)
+# ⚡ Tafel Fitting Tool — Global Polarization Curve Fitter
+# High-quality + reasonable speed:
 # - Dual cathodic (O2 diffusion-limited + H2 evolution)
 # - Film-coverage passivation, transpassive, secondary passivity
 # - Optional uncompensated resistance Rs (ohmic drop)
-# - Optional capacitive current i_cap = Cdl * ν (with automatic scan-direction detection)
-# - Robust loss options: Log L2, Hybrid (log+linear), Huber (log)
-# - Feature-preserving thinning (Ecorr/Epp/Eb/Esp anchors)
-# - Adaptive optimization with fallback: Fast → Balanced → Thorough, multi-start local restarts
+# - Optional capacitive current i_cap = Cdl * ν (with scan-direction detection)
+# - Robust loss options (default: Log L2 for accuracy)
+# - Feature-preserving thinning with Ecorr/Epp/Eb/Esp anchors
+# - Adaptive optimization: DE + L-BFGS-B (+ optional NM), local restarts, fallback
+# - Final full-data refine
 # - Demo fitting removed
 
 import streamlit as st
@@ -129,10 +131,10 @@ def scan_direction_sign(E):
     s[s==0] = 1.0
     return s
 
-def feature_preserving_thin(E, i, reg, max_points=800):
+def feature_preserving_thin(E, i, reg, max_points=1200):
     """
-    Adaptive thinning with anchors at detected features: Ecorr index, passive regions,
-    breakdown Eb, secondary Esp. Keeps endpoints and distributes by curvature in log-space.
+    Adaptive thinning with anchors at detected features: Ecorr index, p1/p2 (passive windows),
+    Eb, Esp. Keeps endpoints and distributes by curvature in log-space.
     Returns (E_fit, i_fit, idx).
     """
     n=len(E)
@@ -147,35 +149,40 @@ def feature_preserving_thin(E, i, reg, max_points=800):
     # base weights: curvature and slope
     w = 1.0 + 4.0*np.abs(g) + 8.0*np.abs(c)
 
-    # anchors: endpoints + near Ecorr + passivation + breakdown + secondary
-    anchors = set()
-    anchors.add(0); anchors.add(n-1)
-    if "eci" in reg and isinstance(reg["eci"], (int, np.integer)):
-        anchors.add(int(np.clip(reg["eci"],0,n-1)))
-    for key in ["p1","p2"]:
-        if key in reg:
-            anchors.add(int(np.clip(reg[key]["ps"],0,n-1)))
-            anchors.add(int(np.clip(reg[key]["pe"],0,n-1)))
-    for key in ["Eb"]:
-        if key in reg:
-            # choose closest index to Eb
-            k = int(np.argmin(np.abs(E - reg[key])))
-            anchors.add(int(np.clip(k,0,n-1)))
+    # anchor centers and half-windows (in volts)
+    anchors_idx = set([0, n-1])
+    windows = []
+    if "eci" in reg:
+        k = int(np.clip(reg["eci"],0,n-1)); anchors_idx.add(k); windows.append((E[k], 0.06))
+    if "p1" in reg:
+        ps, pe = reg["p1"]["ps"], reg["p1"]["pe"]
+        anchors_idx.update([int(np.clip(ps,0,n-1)), int(np.clip(pe,0,n-1))])
+        windows.append((reg["p1"]["Es"], 0.08))
+    if "Eb" in reg:
+        k = int(np.argmin(np.abs(E - reg["Eb"]))); anchors_idx.add(k); windows.append((reg["Eb"], 0.06))
+    if "p2" in reg:
+        ps, pe = reg["p2"]["ps"], reg["p2"]["pe"]
+        anchors_idx.update([int(np.clip(ps,0,n-1)), int(np.clip(pe,0,n-1))])
+        windows.append((reg["p2"]["Es"], 0.08))
 
-    # boost weights near anchors (± window)
-    for a in list(anchors):
-        lo = max(0, a-5); hi = min(n-1, a+5)
-        w[lo:hi+1] *= 10.0
+    # boost weights in windows and around anchor indices
+    for E0, hw in windows:
+        m = (E >= E0 - hw) & (E <= E0 + hw)
+        w[m] *= 12.0
+    for a in list(anchors_idx):
+        lo = max(0, a-8); hi = min(n-1, a+8)
+        w[lo:hi+1] *= 6.0
 
     s = np.cumsum(w)
-    if s[-1] <= 0 or not np.isfinite(s[-1]):
+    if not np.isfinite(s[-1]) or s[-1] <= 0:
         idx = np.unique(np.linspace(0, n-1, max_points).astype(int))
         return E[idx], i[idx], idx
     s = (s - s[0]) / (s[-1] - s[0] + 1e-12)
     xs = np.linspace(0, 1, max_points)
     idx = np.unique(np.searchsorted(s, xs))
-    # ensure anchors present
-    idx = np.unique(np.concatenate([idx, np.array(sorted(list(anchors)), dtype=int)]))
+
+    # enforce anchor indices
+    idx = np.unique(np.concatenate([idx, np.array(sorted(list(anchors_idx)), dtype=int)]))
     idx[0]=0; idx[-1]=n-1
     return E[idx], i[idx], idx
 
@@ -191,9 +198,20 @@ PN = ["Ecorr","icorr","ba","bc1","iL",
 NP = 17
 LOG_I = {1,4,5,9,11,15}  # currents (icorr, iL, i0_c2, ipass, a_tp, ipass2)
 
+def _prepare_i_cap(E, i_cap):
+    E = np.asarray(E, dtype=float)
+    if i_cap is None:
+        return np.zeros_like(E)
+    arr = np.asarray(i_cap, dtype=float)
+    if arr.shape != E.shape:
+        if arr.size == 1:
+            return np.full_like(E, float(arr))
+        return np.zeros_like(E)
+    return arr
+
 def gmodel(E, p, i_cap=None):
     """Global polarization model with ohmic drop and optional capacitive current.
-    Iterations: fewer when Rs≈0; more when Rs>0."""
+    Iterations: 1 if Rs≈0, else 6 for accuracy."""
     Ecorr,icorr,ba,bc1,iL = p[0],p[1],p[2],p[3],p[4]
     i0_c2,bc2 = p[5],p[6]
     Epp,k_pass,ipass = p[7],p[8],p[9]
@@ -202,19 +220,9 @@ def gmodel(E, p, i_cap=None):
     Rs = max(p[16], 0.0)
 
     E = np.asarray(E, dtype=float)
-    if i_cap is None:
-        i_cap_arr = np.zeros_like(E)
-    else:
-        i_cap_arr = np.asarray(i_cap, dtype=float)
-        if i_cap_arr.shape != E.shape:
-            if i_cap_arr.size == 1:
-                i_cap_arr = np.full_like(E, float(i_cap_arr))
-            else:
-                i_cap_arr = np.zeros_like(E)
+    i_cap_arr = _prepare_i_cap(E, i_cap)
 
-    # iterations: 1 if Rs≈0, else 4 for better accuracy
-    n_it = 1 if Rs <= 1e-4 else 4
-
+    n_it = 1 if Rs <= 1e-4 else 6
     E_eff = E.copy()
     i_net = np.zeros_like(E)
 
@@ -261,18 +269,8 @@ def gcomp(E, p, i_cap=None):
     Rs = max(p[16], 0.0)
 
     E = np.asarray(E, dtype=float)
-    if i_cap is None:
-        i_cap_arr = np.zeros_like(E)
-    else:
-        i_cap_arr = np.asarray(i_cap, dtype=float)
-        if i_cap_arr.shape != E.shape:
-            if i_cap_arr.size == 1:
-                i_cap_arr = np.full_like(E, float(i_cap_arr))
-            else:
-                i_cap_arr = np.zeros_like(E)
-
-    # same iteration rule as gmodel
-    n_it = 1 if Rs <= 1e-4 else 4
+    i_cap_arr = _prepare_i_cap(E, i_cap)
+    n_it = 1 if Rs <= 1e-4 else 6
 
     E_eff = E.copy()
     for _ in range(n_it):
@@ -319,7 +317,7 @@ class CT:
                [0,1,2,3,4,5,6,7,8,9,10,11,12]),
         "PTS":("Full: + Secondary Passivity",
                "Active→passive→transpassive→secondary passivity.",
-               list(range(16))),  # Rs handled separately
+               list(range(16))),
         "PP": ("Passive + Pitting",
                "Passive with sharp pitting breakdown at Epit.",
                [0,1,2,3,4,5,6,7,8,9,10,11,12]),
@@ -511,7 +509,7 @@ def init_guess(E, i, reg):
     ])
 
 # ================================================================
-# OPTIMIZER WITH ADAPTIVE FALLBACKS & MULTI-START
+# OPTIMIZER (DE + L-BFGS-B + optional NM) with restarts
 # ================================================================
 class Optimizer:
     def __init__(self, E, i, reg, p0, i_cap_vec, fit_rs, rs_bounds, loss_cfg, opt_cfg):
@@ -528,15 +526,14 @@ class Optimizer:
         self.nf=len(self.fidx)
 
         self.loss_cfg = loss_cfg
-        self.opt_cfg = opt_cfg  # dict: speed_mode, de_pop, de_iter, lbfgs_maxiter, nm_use, nm_maxiter, escalate_r2, restarts, jitter
+        self.opt_cfg = opt_cfg  # dict: use_de, de_pop, de_iter, lbfgs_maxiter, use_nm, nm_maxiter, restarts, jitter
 
         self.log=[]; self.best_p=p0.copy(); self.best_s=1e30
         self._bounds(rs_bounds)
 
     def _bounds(self, rs_bounds):
         p=self.pfull; reg=self.reg; Ec=p[0]; ic=max(p[1],1e-14)
-        Emax=float(np.max(self.E))
-        rs_lo, rs_hi = rs_bounds
+        Emax=float(np.max(self.E)); rs_lo, rs_hi = rs_bounds
         self.lo=np.array([
             Ec-0.20, max(ic*1e-4,1e-15), 0.010, 0.010,
             max(reg.get("iL",1e-6)*0.01,1e-10),
@@ -587,20 +584,17 @@ class Optimizer:
         lt = self.loss_cfg.get("type","log_l2")
         if lt == "log_l2":
             return float(np.sum(res_log**2))
-
         elif lt == "hybrid":
-            alpha = float(self.loss_cfg.get("alpha", 0.7))  # slightly more log emphasis
+            alpha = float(self.loss_cfg.get("alpha", 0.7))
             scale = float(self.loss_cfg.get("linear_scale", np.median(np.abs(self.i))+1e-12))
             res_lin = (self.i - im) / (scale if scale>0 else 1.0)
             return float(alpha*np.sum(res_log**2) + (1.0-alpha)*np.sum(res_lin**2))
-
         elif lt == "huber_log":
             delta = float(self.loss_cfg.get("delta", 0.3))
             ares = np.abs(res_log)
             quad = ares <= delta
             loss = np.where(quad, 0.5*res_log**2, delta*(ares - 0.5*delta))
             return float(np.sum(loss))
-
         else:
             return float(np.sum(res_log**2))
 
@@ -620,10 +614,8 @@ class Optimizer:
         self.log.append(f"  {tag}: R²={rv:.6f} (no impr.)")
         return False
 
-    def _local_restart(self, base_x, label, maxiter=1000, jitter=0.08):
-        """Local L-BFGS-B restart around base_x with jitter in packed space."""
+    def _local_restart(self, base_x, label, maxiter=1500, jitter=0.06):
         bnds = self._pbounds()
-        # jitter: random within small fraction of bounds width
         width = np.array([b[1]-b[0] for b in bnds])
         x0 = base_x + np.random.uniform(-jitter, jitter, size=len(base_x)) * width
         x0 = np.clip(x0, [b[0] for b in bnds], [b[1] for b in bnds])
@@ -647,11 +639,10 @@ class Optimizer:
         self.log.append(f"  Init: R²={rv0:.4f}")
         bnds=self._pbounds()
 
-        # Stage 1: DE (mode dependent)
-        mode = self.opt_cfg.get("speed_mode","Balanced")
-        if self.opt_cfg.get("use_de", mode!="Fast"):
-            ps=self.opt_cfg.get("de_pop", max(8, min(12, self.nf)))
-            mi=self.opt_cfg.get("de_iter", 220 if mode=="Balanced" else 320)
+        # Stage 1: DE (optional)
+        if self.opt_cfg.get("use_de", True):
+            ps=self.opt_cfg.get("de_pop", max(10, min(12, self.nf)))
+            mi=self.opt_cfg.get("de_iter", 300)
             self.log.append(f"Stage 1: DE  pop={ps} iter={mi}")
             try:
                 t1=time.time()
@@ -663,53 +654,46 @@ class Optimizer:
             except Exception as ex:
                 self.log.append(f"  DE err: {ex}")
         else:
-            self.log.append("Stage 1: DE skipped (Fast mode)")
+            self.log.append("Stage 1: DE skipped")
 
-        # Stage 2: L-BFGS-B local
+        # Stage 2: L-BFGS-B (local)
         self.log.append("Stage 2: L-BFGS-B")
         try:
             t1=time.time()
             r2v=minimize(
                 self._obj,self._pack(self.best_p),method="L-BFGS-B",bounds=bnds,
-                options={"maxiter":int(self.opt_cfg.get("lbfgs_maxiter", 1500)),"ftol":1e-12,"gtol":1e-10}
+                options={"maxiter":int(self.opt_cfg.get("lbfgs_maxiter", 2000)),"ftol":1e-12,"gtol":1e-10}
             )
             self._up(r2v.x,f"L-BFGS-B ({time.time()-t1:.1f}s)")
         except Exception as ex:
             self.log.append(f"  L-BFGS-B err: {ex}")
 
         # Stage 3: Nelder-Mead (optional)
-        if self.opt_cfg.get("use_nm", mode=="Thorough"):
+        if self.opt_cfg.get("use_nm", True):
             self.log.append("Stage 3: Nelder-Mead")
             try:
                 t1=time.time()
                 r3=minimize(self._obj,self._pack(self.best_p),method="Nelder-Mead",
-                    options={"maxiter":int(self.opt_cfg.get("nm_maxiter", 6000)),"xatol":1e-12,"fatol":1e-12,"adaptive":True})
+                    options={"maxiter":int(self.opt_cfg.get("nm_maxiter", 7000)),"xatol":1e-12,"fatol":1e-12,"adaptive":True})
                 self._up(r3.x,f"NM ({time.time()-t1:.1f}s)")
             except Exception as ex:
                 self.log.append(f"  NM err: {ex}")
         else:
             self.log.append("Stage 3: NM skipped")
 
-        # Adaptive fallback: multi-start local if R² below threshold
+        # Local restarts (multi-start)
+        restarts = int(self.opt_cfg.get("restarts", 3))
+        jitter = float(self.opt_cfg.get("jitter", 0.06))
+        if restarts > 0:
+            bx = self._pack(self.best_p)
+            for k in range(restarts):
+                self._local_restart(bx, f"Restart {k+1}", maxiter=self.opt_cfg.get("lbfgs_maxiter", 2000), jitter=jitter)
+
+        dt=time.time()-t0
         try:
             rv=r2(self.ld,slog(gmodel(self.E,self.best_p, i_cap=self.i_cap_vec)))
         except Exception:
             rv=0.0
-        thresh = float(self.opt_cfg.get("escalate_r2", 0.97))
-        restarts = int(self.opt_cfg.get("restarts", 3))
-        jitter = float(self.opt_cfg.get("jitter", 0.06))
-        if rv < thresh and restarts > 0:
-            self.log.append(f"Adaptive restarts: R²={rv:.4f} < {thresh:.2f} → {restarts} local restarts")
-            bx = self._pack(self.best_p)
-            for k in range(restarts):
-                self._local_restart(bx, f"Restart {k+1}", maxiter=self.opt_cfg.get("lbfgs_maxiter", 1500), jitter=jitter)
-            # recompute rv
-            try:
-                rv=r2(self.ld,slog(gmodel(self.E,self.best_p, i_cap=self.i_cap_vec)))
-            except Exception:
-                rv=0.0
-
-        dt=time.time()-t0
         q="Excellent" if rv>=0.995 else "Good" if rv>=0.97 else "Acceptable" if rv>=0.90 else "Poor"
         self.log.append(f"Result: {q}  R²(log)={rv:.6f}  [{dt:.1f}s]")
         return self.best_p, rv
@@ -726,7 +710,7 @@ def diagnose(E, i, reg, bp, rv, i_cap_vec):
         else: issues.append(("Low noise",f"σ={noise:.3f} dec.","o"))
     if bp is not None:
         if bp[2]*1000>200: issues.append(("Large βa",f"{bp[2]*1000:.0f} mV/dec — possible IR drop or multi-step mechanism.","w"))
-        if bp[3]*1000>200: issues.append(("Large βc₁",f"{bp[3]*1000:.0f} mV/dec — possible diffusion in Tafel region or IR drop.","w"))
+        if bp[3]*1000>200: issues.append(("Large βc₁",f"{bp[3]*1000:.0f} mV/dec — possible diffusion or IR drop.","w"))
         if bp[6]*1000>250: issues.append(("Large βc₂ (H₂)",f"{bp[6]*1000:.0f} mV/dec — may indicate coupled reactions.","w"))
         if bp[16] > 0.0:
             issues.append(("Uncompensated resistance", f"Rs ≈ {bp[16]:.2f} Ω·cm² — IR drop correction applied.", "o"))
@@ -786,7 +770,7 @@ def plot_main(E, i, bp, reg, ct, i_cap_vec):
     if bp is not None:
         Em=np.linspace(np.min(E),np.max(E),800)
         try:
-            im=gmodel(Em,bp)  # faradaic-only curve
+            im=gmodel(Em,bp)  # faradaic-only baseline
             rv=r2(lg,slog(gmodel(E,bp, i_cap=i_cap_vec)))
             fig.add_trace(go.Scatter(x=Em,y=slog(im),mode="lines",
                 name=f"Global Fit (faradaic)  R²(log)={rv:.4f}",line=dict(color=CL["fit"],width=3)))
@@ -846,7 +830,7 @@ def plot_res(E, i, bp, i_cap_vec):
         margin=dict(l=70,r=20,t=40,b=60),showlegend=True,
         legend=dict(bgcolor="rgba(19,19,32,0.9)",bordercolor=CL["grid"],font=dict(color=CL["tx"],size=11)))
     fig.update_yaxes(gridcolor=CL["grid"],color=CL["tx"])
-    fig.update_xaxes(gridcolor=CL["grid"],color="#cdd6f4",title_text="Potential (V)",row=2)
+    fig.update_xaxes(gridcolor=CL["grid"],color=CL["tx"],title_text="Potential (V)",row=2)
     return fig
 
 # ================================================================
@@ -921,81 +905,109 @@ MATS={"Carbon Steel / Iron":(27.92,7.87),"304 Stainless Steel":(25.10,7.90),
     "316 Stainless Steel":(25.56,8.00),"Copper":(31.77,8.96),"Aluminum":(8.99,2.70),
     "Nickel":(29.36,8.91),"Titanium":(11.99,4.51),"Zinc":(32.69,7.14),"Custom":(27.92,7.87)}
 
-def process(E_full, i_full, area, ew, rho, cap_cfg, fit_rs, rs_bounds, loss_cfg,
-            speed_mode, max_fit_points, show_components, escalate_r2, restarts, jitter):
-    # Capacitive current vector (full)
-    if cap_cfg.get("include", False):
+def process(E_full, i_full, area, ew, rho, cap_cfg_ui, fit_rs_ui, rs_bounds, loss_cfg_ui,
+            speed_mode, max_fit_points, show_components, use_full_fit, escalate_r2, restarts, jitter):
+    # Capacitive current vector (full) from UI
+    if cap_cfg_ui.get("include", False):
         sgn = scan_direction_sign(E_full)
-        i_cap_vec_full = cap_cfg["Cdl"] * cap_cfg["nu"] * sgn
+        i_cap_vec_full = cap_cfg_ui["Cdl"] * cap_cfg_ui["nu"] * sgn
     else:
         i_cap_vec_full = np.zeros_like(E_full)
 
     prog=st.progress(0,text="Detecting regions (full data)...")
     reg=detect(E_full,i_full); ct=reg["ct"]
 
-    # Thinning for fitting with feature anchors
-    prog.progress(12,text=f"Thinning (anchors at Ecorr/Epp/Eb/Esp) to ≤ {max_fit_points} pts...")
-    E_fit, i_fit, idx_fit = feature_preserving_thin(E_full, i_full, reg, max_points=max_fit_points)
-    i_cap_fit = i_cap_vec_full[idx_fit] if i_cap_vec_full is not None else np.zeros_like(E_fit)
+    # Stage A: Thinning (or full) — First pass without Rs and Cdl for stability
+    prog.progress(12,text=f"Selecting data for fitting...")
+    if use_full_fit:
+        E_fit, i_fit = E_full, i_full
+        i_cap_fit = np.zeros_like(E_fit)  # first pass: disable Cdl
+    else:
+        E_fit, i_fit, idx_fit = feature_preserving_thin(E_full, i_full, reg, max_points=max_fit_points)
+        i_cap_fit = np.zeros_like(E_fit)  # first pass: disable Cdl
 
-    # Initial guess from full data (more stable)
-    prog.progress(22,text="Initial estimates (full data)...")
+    # Initial guess from full data for stability
+    prog.progress(20,text="Initial estimates...")
     p0=init_guess(E_full,i_full,reg)
 
-    # Configure optimizer options from speed mode
-    if "Fast" in speed_mode:
-        opt_cfg = {"speed_mode":"Fast","use_de":False,"lbfgs_maxiter":1200,"use_nm":False,
-                   "escalate_r2":escalate_r2,"restarts":restarts,"jitter":jitter}
-    elif "Balanced" in speed_mode:
-        opt_cfg = {"speed_mode":"Balanced","use_de":True,"de_pop":10,"de_iter":240,
-                   "lbfgs_maxiter":1800,"use_nm":False,
-                   "escalate_r2":escalate_r2,"restarts":restarts,"jitter":jitter}
+    # Optimizer configs from speed mode
+    if speed_mode == "Fast":
+        opt_cfg_A = {"use_de": False, "lbfgs_maxiter": 1500, "use inline": False,
+                     "use_nm": False, "restarts": restarts, "jitter": jitter}
+    elif speed_mode == "Balanced":
+        opt_cfg_A = {"use_de": True, "de_pop": 10, "de_iter": 260,
+                     "lbfgs_maxiter": 1800, "use_nm": False,
+                     "restarts": restarts, "jitter": jitter}
     else:  # Thorough
-        opt_cfg = {"speed_mode":"Thorough","use_de":True,"de_pop":12,"de_iter":360,
-                   "lbfgs_maxiter":2200,"use_nm":True,"nm_maxiter":6000,
-                   "escalate_r2":escalate_r2,"restarts":restarts,"jitter":jitter}
+        opt_cfg_A = {"use_de": True, "de_pop": 12, "de_iter": 360,
+                     "lbfgs_maxiter": 2200, "use_nm": True, "nm_maxiter": 6000,
+                     "restarts": restarts, "jitter": jitter}
 
-    # Optimize on thinned data
-    prog.progress(34,text=f"Optimizing ({CT.nfree(ct)}+{'Rs' if fit_rs else '0'} params) on thinned data...")
-    opt=Optimizer(E_fit,i_fit,reg,p0,i_cap_fit,fit_rs,rs_bounds,loss_cfg,opt_cfg)
-    bp,rv=opt.run()
+    # Stage A optimization (thinned/full, Rs OFF, Cdl OFF)
+    prog.progress(30,text=f"Stage A: optimizing (no Rs/Cdl)...")
+    optA=Optimizer(E_fit,i_fit,reg,p0,i_cap_fit,False,rs_bounds,{"type":"log_l2"},opt_cfg_A)
+    bpA,rvA=optA.run()
 
-    # If still below threshold, escalate: more points or full data + Balanced/Thorough rerun
-    if rv < escalate_r2:
-        prog.progress(66,text=f"Fallback: adding points / stronger optimizer (target R² ≥ {escalate_r2:.2f})...")
-        # Try with more points (up to full) and stronger mode if needed
-        E_fit2, i_fit2, idx_fit2 = feature_preserving_thin(E_full, i_full, reg, max_points=min(len(E_full), max_fit_points*2))
-        i_cap_fit2 = i_cap_vec_full[idx_fit2]
-        # Stronger config
-        opt_cfg2 = {"speed_mode":"Thorough","use_de":True,"de_pop":12,"de_iter":420,
-                    "lbfgs_maxiter":2500,"use_nm":True,"nm_maxiter":8000,
-                    "escalate_r2":escalate_r2,"restarts":max(2,restarts),"jitter":max(0.05,jitter)}
-        opt2=Optimizer(E_fit2,i_fit2,reg,bp,i_cap_fit2,fit_rs,rs_bounds,loss_cfg,opt_cfg2)
-        bp2,rv2=opt2.run()
-        # Accept if better
-        if rv2 > rv:
-            bp,rv = bp2, rv2
-            opt.log += ["Fallback accepted: improved fit.", f"  New R²(log)={rv:.4f}"]
+    # Stage B: Thinned/full refine with UI Rs/Cdl options
+    prog.progress(55,text="Stage B: refine with UI Rs/Cdl...")
+    fit_rs_B = fit_rs_ui
+    i_cap_fit_B = (i_cap_vec_full if use_full_fit else i_cap_vec_full[idx_fit]) if cap_cfg_ui.get("include", False) else np.zeros_like(E_fit)
+    opt_cfg_B = opt_cfg_A.copy()
+    optB=Optimizer(E_fit,i_fit,reg,bpA,i_cap_fit_B,fit_rs_B,rs_bounds,loss_cfg_ui,opt_cfg_B)
+    bpB,rvB=optB.run()
+
+    # Stage C: Fallback escalation if needed
+    if rvB < escalate_r2:
+        prog.progress(72,text=f"Stage C: fallback (target R² ≥ {escalate_r2:.2f})...")
+        # Add more points if thinning was used
+        if not use_full_fit:
+            E_fit2, i_fit2, idx_fit2 = feature_preserving_thin(E_full, i_full, reg, max_points=min(len(E_full), max_fit_points*2))
+            i_cap_fit2 = i_cap_vec_full[idx_fit2] if cap_cfg_ui.get("include", False) else np.zeros_like(E_fit2)
+        else:
+            E_fit2, i_fit2 = E_fit, i_fit
+            i_cap_fit2 = i_cap_fit_B
+        # Stronger settings
+        opt_cfg_C = {"use_de": True, "de_pop": 12, "de_iter": 420,
+                     "lbfgs_maxiter": 2500, "use_nm": True, "nm_maxiter": 8000,
+                     "restarts": max(2,restarts), "jitter": max(0.05,jitter)}
+        optC=Optimizer(E_fit2,i_fit2,reg,bpB,i_cap_fit2,fit_rs_ui,rs_bounds,loss_cfg_ui,opt_cfg_C)
+        bpC,rvC=optC.run()
+        if rvC > rvB:
+            bpB, rvB, optB = bpC, rvC, optC
+
+    # Stage D: Final full-data refine (pure log L2) for maximum R²
+    prog.progress(90,text="Stage D: final full-data refine...")
+    # First refine without Rs/Cdl
+    opt_ref_cfg = {"use_de": False, "lbfgs_maxiter": 4000, "use_nm": False, "restarts": 0, "jitter": 0.0}
+    optRef=Optimizer(E_full,i_full,reg,bpB,np.zeros_like(E_full),False,rs_bounds,{"type":"log_l2"},opt_ref_cfg)
+    bp,rv=optRef.run()
+    # If UI enables Rs/Cdl, short refine with them enabled
+    if fit_rs_ui or cap_cfg_ui.get("include", False):
+        i_cap_vec_use = i_cap_vec_full if cap_cfg_ui.get("include", False) else np.zeros_like(E_full)
+        optRef2=Optimizer(E_full,i_full,reg,bp,i_cap_vec_use,fit_rs_ui,rs_bounds,{"type":"log_l2"}, {"use_de":False,"lbfgs_maxiter":2000,"use_nm":False,"restarts":0,"jitter":0.0})
+        bp,rv=optRef2.run()
 
     # Diagnostics on full data
-    prog.progress(92,text="Diagnostics (full data)...")
-    diags=diagnose(E_full,i_full,reg,bp,rv,i_cap_vec_full)
     prog.progress(100,text="Done!"); prog.empty()
+    diags=diagnose(E_full,i_full,reg,bp,rv, i_cap_vec_full if cap_cfg_ui.get("include", False) else np.zeros_like(E_full))
 
     st.markdown("---")
-    st.plotly_chart(plot_main(E_full,i_full,bp,reg,ct,i_cap_vec_full),use_container_width=True)
+    st.plotly_chart(plot_main(E_full,i_full,bp,reg,ct, i_cap_vec_full if cap_cfg_ui.get("include", False) else np.zeros_like(E_full)),use_container_width=True)
     c1,c2=st.columns(2)
     with c1:
         if show_components:
             fc=plot_comp(E_full,bp,ct)
             if fc: st.plotly_chart(fc,use_container_width=True)
         else:
-            st.info("Component plot disabled (speed).")
+            st.info("Component plot disabled.")
     with c2:
-        fr=plot_res(E_full,i_full,bp,i_cap_vec_full)
+        fr=plot_res(E_full,i_full,bp, i guided := (i_cap_vec_full if cap_cfg_ui.get('include', False) else np.zeros_like(E_full)))
+        # Fallback if variable name issue:
+        if fr is None:
+            fr=plot_res(E_full,i_full,bp, i_cap_vec_full if cap_cfg_ui.get("include", False) else np.zeros_like(E_full))
         if fr: st.plotly_chart(fr,use_container_width=True)
 
-    st.markdown("---"); show_p(bp,reg,ew,rho,ct,rv,cap_cfg)
+    st.markdown("---"); show_p(bp,reg,ew,rho,ct,rv,cap_cfg_ui)
     st.markdown("---"); st.markdown("### Data Quality Diagnostics")
     for t,m,s in diags:
         cls={"e":"bx ber","w":"bx bwn","o":"bx bok"}[s]
@@ -1005,23 +1017,24 @@ def process(E_full, i_full, area, ew, rho, cap_cfg, fit_rs, rs_bounds, loss_cfg,
         with st.expander("Model Equation"):
             p=dict(zip(PN,bp))
             st.markdown(f"""
-**Dual-Cathodic Film-Coverage Model (with Rs)**
+**Dual-Cathodic Film-Coverage Model (with optional Rs)**
 
 `i_net = i_anodic_total − (i_O₂ + i_H₂) + i_cap`
 
-- O₂ (diff.-limited): `i_O₂ = i_kin / (1 + i_kin / iL)`, `i_kin = icorr·exp(−2.303η/βc₁)`
+- O₂ (diff.-limited): `i_O₂ = i_kin / (1 + i_kin / iL)`, where `i_kin = icorr·exp(−2.303η/βc₁)`
 - H₂ (activation): `i_H₂ = i₀,c₂·exp(−2.303η/βc₂)`
 - Active anodic: `i_act = icorr·exp( 2.303η/βa )`
 - Primary passivation: `θ₁ = σ(k₁·(E−Epp))`, `i = i_act·(1−θ₁) + ipass·θ₁`
 - Transpassive: `i_tp = a_tp·exp(b_tp·(E−Eb))·σ(E−Eb)`
 - Secondary passivation: `θ₂ = σ(k₂·(E−Esp))`, `i_an = (i_p1+i_tp)·(1−θ₂) + ipass₂·θ₂`
 
-Ohmic drop: `E_eff = E − Rs·i_net` (self-consistent; more iterations when Rs>0)
+Ohmic drop: `E_eff = E − Rs·i_net` (self-consistent iterations)
 
 Fitted: Ecorr={p['Ecorr']:.4f} V, icorr={p['icorr']:.3e}, βa={p['ba']*1000:.1f}, βc₁={p['bc1']*1000:.1f} mV/dec, Rs={p['Rs']:.3f} Ω·cm²
 """)
     with st.expander("Optimization Log"):
-        for msg in opt.log: st.markdown(f"- {msg}")
+        for msg in optA.log + optB.log + (optRef.log if 'optRef' in locals() else []):
+            st.markdown(f"- {msg}")
     cd1,cd2=st.columns(2)
     with cd1:
         rows=[("Curve type",CT.INFO.get(ct,("?","",0))[0]),
@@ -1050,7 +1063,7 @@ def main():
         border:1px solid #313244;border-radius:12px;padding:20px 28px;margin-bottom:20px">
       <h1 style="margin:0;color:#cdd6f4;font-size:26px">⚡ Tafel Fitting Tool</h1>
       <p style="margin:4px 0 0;color:#6c7086;font-size:13px">
-        Dual-cathodic global model · Film-coverage physics · Optional Rs & Cdl · Robust loss · Adaptive for quality & speed
+        Dual-cathodic global model · Film-coverage physics · Optional Rs & Cdl · Final full-data refine
       </p></div>""",unsafe_allow_html=True)
     with st.sidebar:
         st.markdown("### Settings")
@@ -1065,12 +1078,13 @@ def main():
 
         st.divider()
         st.markdown("#### Speed & Quality")
-        speed_mode = st.selectbox("Speed mode", ["Fast","Balanced","Thorough"], index=1)
-        max_fit_points = st.slider("Max points for fitting (thinning)", 300, 4000, 900, 50)
+        speed_mode = st.selectbox("Speed mode", ["Fast","Balanced","Thorough"], index=2)
+        max_fit_points = st.slider("Max points for fitting (thinning)", 300, 4000, 1200, 50)
+        use_full_fit = st.checkbox("Use full dataset for fitting (skip thinning)", value=False)
         show_components = st.checkbox("Show component plot", value=True)
-        escalate_r2 = st.slider("Fallback threshold R² (log)", 0.90, 0.995, 0.97, 0.005)
+        escalate_r2 = st.slider("Fallback threshold R² (log)", 0.90, 0.995, 0.98, 0.005)
         restarts = st.slider("Local restarts (multi-start)", 0, 8, 3, 1)
-        jitter = st.slider("Restart jitter (packed space fraction)", 0.02, 0.20, 0.06, 0.01)
+        jitter = st.slider("Restart jitter (packed-space fraction)", 0.02, 0.20, 0.06, 0.01)
 
         st.divider()
         st.markdown("#### Ohmic Drop (Rs)")
@@ -1078,7 +1092,7 @@ def main():
         rs_lo = st.number_input("Rs lower bound (Ω·cm²)", 0.0, 1e4, 0.0, 0.1)
         rs_hi = st.number_input("Rs upper bound (Ω·cm²)", 0.0, 1e4, 200.0, 0.1)
         if not enable_rs:
-            st.caption("Rs fixed at 0.0 Ω·cm² (no IR compensation in parameters).")
+            st.caption("First pass ignores Rs for stability; final refine can re-enable if checked.")
 
         st.divider()
         st.markdown("#### Capacitive Current (Cdl · ν)")
@@ -1089,8 +1103,8 @@ def main():
             st.warning("Scan rate is 0; capacitive current will be zero.")
 
         st.divider()
-        st.markdown("#### Loss Function")
-        loss_type = st.selectbox("Type", ["Log L2", "Hybrid (log+linear)", "Huber (log)"])
+        st.markdown("#### Loss Function (main fit)")
+        loss_type = st.selectbox("Type", ["Log L2", "Hybrid (log+linear)", "Huber (log)"], index=0)
         alpha = st.slider("Hybrid weight α (log vs linear)", 0.0, 1.0, 0.7)
         delta = st.slider("Huber δ (decades)", 0.05, 1.0, 0.30)
         linear_scale = st.number_input("Linear residual scale (A/cm²)", 0.0, 1e3, 0.0, format="%.6f",
@@ -1098,9 +1112,9 @@ def main():
 
         st.divider()
         st.markdown("""<div style="font-size:11px;color:#a6adc8;line-height:1.6">
-        - Adaptive fitting: quick pass then fallback to stronger optimizer if R² below threshold.<br>
-        - Thinning preserves key features to maintain fit fidelity with fewer points.<br>
-        - Multi-start local restarts help escape poor local minima.<br>
+        - First pass disables Rs/Cdl to find a stable basin.<br>
+        - Then refines with your Rs/Cdl settings and finally on full data for the best R².<br>
+        - Use Thorough mode and higher Max points for challenging curves.<br>
         </div>""",unsafe_allow_html=True)
 
     up=st.file_uploader("Upload polarization data",type=["csv","txt","xlsx","xls"])
@@ -1136,7 +1150,7 @@ def main():
     rs_bounds = (rs_lo, rs_hi)
 
     process(E_full, i_full, area, ew, rho, cap_cfg, enable_rs, rs_bounds, loss_cfg,
-            speed_mode, max_fit_points, show_components, escalate_r2, restarts, jitter)
+            speed_mode, max_fit_points, show_components, use_full_fit, escalate_r2, restarts, jitter)
 
 if __name__=="__main__":
     main()
