@@ -1,13 +1,10 @@
-# ⚡ Tafel Fitting Tool — Global Polarization Curve Fitter
-# High-quality + reasonable speed:
+# ⚡ Tafel Fitting Tool — Global Polarization Curve Fitter (with Rs & Capacitive Current)
 # - Dual cathodic (O2 diffusion-limited + H2 evolution)
 # - Film-coverage passivation, transpassive, secondary passivity
 # - Optional uncompensated resistance Rs (ohmic drop)
-# - Optional capacitive current i_cap = Cdl * ν (with scan-direction detection)
-# - Robust loss options (default: Log L2 for accuracy)
-# - Feature-preserving thinning with Ecorr/Epp/Eb/Esp anchors
-# - Adaptive optimization: DE + L-BFGS-B (+ optional NM), local restarts, fallback
-# - Final full-data refine
+# - Optional capacitive current i_cap = Cdl * ν (with automatic scan-direction detection)
+# - Robust loss options: Log L2, Hybrid (log+linear), Huber (log)
+# - Adaptive parameter masking by detected curve type
 # - Demo fitting removed
 
 import streamlit as st
@@ -114,12 +111,13 @@ def r2(yt,yp):
 def sig(x,k=1.0): return 1.0/(1.0+np.exp(-np.clip(k*x,-50,50)))
 
 def scan_direction_sign(E):
-    """Sign of dE/dt per point."""
+    """Estimate sign of dE/dt from sequence; returns array (+1/-1) per point."""
     if len(E) < 2:
         return np.ones_like(E)
     dE = np.diff(E)
     s = np.zeros_like(E, dtype=float)
     sgn = np.sign(dE)
+    # Replace zeros by previous non-zero
     last = 1.0
     for k in range(len(E)-1):
         if sgn[k] == 0:
@@ -131,64 +129,18 @@ def scan_direction_sign(E):
     s[s==0] = 1.0
     return s
 
-def feature_preserving_thin(E, i, reg, max_points=1200):
-    """
-    Adaptive thinning with anchors at detected features: Ecorr index, p1/p2 (passive windows),
-    Eb, Esp. Keeps endpoints and distributes by curvature in log-space.
-    Returns (E_fit, i_fit, idx).
-    """
-    n=len(E)
-    if n <= max_points:
-        return E, i, np.arange(n)
-
-    E = np.asarray(E); i = np.asarray(i)
-    lg = slog(i)
-    g = np.gradient(lg, E)
-    c = np.gradient(g, E)
-
-    # base weights: curvature and slope
-    w = 1.0 + 4.0*np.abs(g) + 8.0*np.abs(c)
-
-    # anchor centers and half-windows (in volts)
-    anchors_idx = set([0, n-1])
-    windows = []
-    if "eci" in reg:
-        k = int(np.clip(reg["eci"],0,n-1)); anchors_idx.add(k); windows.append((E[k], 0.06))
-    if "p1" in reg:
-        ps, pe = reg["p1"]["ps"], reg["p1"]["pe"]
-        anchors_idx.update([int(np.clip(ps,0,n-1)), int(np.clip(pe,0,n-1))])
-        windows.append((reg["p1"]["Es"], 0.08))
-    if "Eb" in reg:
-        k = int(np.argmin(np.abs(E - reg["Eb"]))); anchors_idx.add(k); windows.append((reg["Eb"], 0.06))
-    if "p2" in reg:
-        ps, pe = reg["p2"]["ps"], reg["p2"]["pe"]
-        anchors_idx.update([int(np.clip(ps,0,n-1)), int(np.clip(pe,0,n-1))])
-        windows.append((reg["p2"]["Es"], 0.08))
-
-    # boost weights in windows and around anchor indices
-    for E0, hw in windows:
-        m = (E >= E0 - hw) & (E <= E0 + hw)
-        w[m] *= 12.0
-    for a in list(anchors_idx):
-        lo = max(0, a-8); hi = min(n-1, a+8)
-        w[lo:hi+1] *= 6.0
-
-    s = np.cumsum(w)
-    if not np.isfinite(s[-1]) or s[-1] <= 0:
-        idx = np.unique(np.linspace(0, n-1, max_points).astype(int))
-        return E[idx], i[idx], idx
-    s = (s - s[0]) / (s[-1] - s[0] + 1e-12)
-    xs = np.linspace(0, 1, max_points)
-    idx = np.unique(np.searchsorted(s, xs))
-
-    # enforce anchor indices
-    idx = np.unique(np.concatenate([idx, np.array(sorted(list(anchors_idx)), dtype=int)]))
-    idx[0]=0; idx[-1]=n-1
-    return E[idx], i[idx], idx
-
 # ================================================================
 # GLOBAL MODEL  (17 parameters: + Rs)
 # ================================================================
+# p = [Ecorr, icorr, ba, bc1, iL,     — core + O2 cathodic
+#      i0_c2, bc2,                     — H2 evolution
+#      Epp, k_pass, ipass,             — primary passivation
+#      Eb, a_tp, b_tp,                 — transpassive
+#      Esp, k_sp, ipass2,              — secondary passivity
+#      Rs]                             — uncompensated resistance (Ω·cm²)
+#
+# LOG_I indexes are currents; Rs is not log-transformed.
+
 PN = ["Ecorr","icorr","ba","bc1","iL",
       "i0_c2","bc2",
       "Epp","k_pass","ipass",
@@ -198,20 +150,9 @@ PN = ["Ecorr","icorr","ba","bc1","iL",
 NP = 17
 LOG_I = {1,4,5,9,11,15}  # currents (icorr, iL, i0_c2, ipass, a_tp, ipass2)
 
-def _prepare_i_cap(E, i_cap):
-    E = np.asarray(E, dtype=float)
-    if i_cap is None:
-        return np.zeros_like(E)
-    arr = np.asarray(i_cap, dtype=float)
-    if arr.shape != E.shape:
-        if arr.size == 1:
-            return np.full_like(E, float(arr))
-        return np.zeros_like(E)
-    return arr
-
-def gmodel(E, p, i_cap=None):
+def gmodel(E, p, i_cap=None, n_it=4):
     """Global polarization model with ohmic drop and optional capacitive current.
-    Iterations: 1 if Rs≈0, else 6 for accuracy."""
+    Returns net current density i_net (A/cm²)."""
     Ecorr,icorr,ba,bc1,iL = p[0],p[1],p[2],p[3],p[4]
     i0_c2,bc2 = p[5],p[6]
     Epp,k_pass,ipass = p[7],p[8],p[9]
@@ -220,13 +161,13 @@ def gmodel(E, p, i_cap=None):
     Rs = max(p[16], 0.0)
 
     E = np.asarray(E, dtype=float)
-    i_cap_arr = _prepare_i_cap(E, i_cap)
+    i_cap = np.zeros_like(E) if i_cap is None else i_cap.astype(float)
 
-    n_it = 1 if Rs <= 1e-4 else 6
+    # Initialize
     E_eff = E.copy()
     i_net = np.zeros_like(E)
 
-    for _ in range(n_it):
+    for _ in range(max(1, int(n_it))):
         eta = E_eff - Ecorr
 
         # Cathodic 1: O2 reduction (diffusion-limited)
@@ -251,7 +192,7 @@ def gmodel(E, p, i_cap=None):
         i_an = (i_p1 + i_tp)*(1.0 - t2) + ipass2*t2
 
         # Net faradaic + capacitive
-        i_net = i_an - (i_c1 + i_c2) + i_cap_arr
+        i_net = i_an - (i_c1 + i_c2) + i_cap
 
         # Update effective potential with ohmic drop
         if Rs > 0:
@@ -260,7 +201,7 @@ def gmodel(E, p, i_cap=None):
     return i_net
 
 def gcomp(E, p, i_cap=None):
-    """Return components with ohmic drop and optional capacitive current; robust to i_cap shape."""
+    """Return components with ohmic drop and optional capacitive current."""
     Ecorr,icorr,ba,bc1,iL = p[0:5]
     i0_c2,bc2 = p[5:7]
     Epp,k_pass,ipass = p[7:10]
@@ -269,11 +210,10 @@ def gcomp(E, p, i_cap=None):
     Rs = max(p[16], 0.0)
 
     E = np.asarray(E, dtype=float)
-    i_cap_arr = _prepare_i_cap(E, i_cap)
-    n_it = 1 if Rs <= 1e-4 else 6
+    i_cap = np.zeros_like(E) if i_cap is None else i_cap.astype(float)
 
     E_eff = E.copy()
-    for _ in range(n_it):
+    for _ in range(4):
         eta = E_eff - Ecorr
         ic1k = icorr*np.exp(np.clip(-2.303*eta/np.maximum(bc1,1e-12), -50, 50))
         i_c1 = ic1k/(1.0 + np.where(iL>0, ic1k/np.maximum(iL,1e-20), 0.0))
@@ -282,7 +222,7 @@ def gcomp(E, p, i_cap=None):
         t1 = sig(E_eff - Epp, k_pass); i_p1 = i_act*(1.0 - t1) + ipass*t1
         i_tp = a_tp*np.exp(np.clip(b_tp*(E_eff - Eb), -50, 50))*sig(E_eff - Eb, 40.0)
         t2 = sig(E_eff - Esp, k_sp); i_an = (i_p1 + i_tp)*(1.0 - t2) + ipass2*t2
-        i_net = i_an - (i_c1 + i_c2) + i_cap_arr
+        i_net = i_an - (i_c1 + i_c2) + i_cap
         if Rs > 0:
             E_eff = E - i_net * Rs
 
@@ -317,7 +257,7 @@ class CT:
                [0,1,2,3,4,5,6,7,8,9,10,11,12]),
         "PTS":("Full: + Secondary Passivity",
                "Active→passive→transpassive→secondary passivity.",
-               list(range(16))),
+               list(range(16))),  # indices up to ipass2; Rs handled separately
         "PP": ("Passive + Pitting",
                "Passive with sharp pitting breakdown at Epit.",
                [0,1,2,3,4,5,6,7,8,9,10,11,12]),
@@ -334,9 +274,10 @@ class CT:
         return len(CT.free_idx(ct))
 
 # ================================================================
-# REGION DETECTION (sorted copy for stable gradients)
+# REGION DETECTION (uses potential-sorted copy for stability)
 # ================================================================
 def detect(E, i):
+    # Work on a sorted-by-E copy for robust gradients
     idx_sort = np.argsort(E)
     Es = E[idx_sort]; is_ = i[idx_sort]
     reg={}; n=len(Es); ai=np.abs(is_)
@@ -351,10 +292,10 @@ def detect(E, i):
         k=int(np.argmin(ai)); reg["Ecorr"]=float(Es[k]); reg["eci"]=int(idx_sort[k])
     Ec=reg["Ecorr"]
 
-    # Cathodic
+    # Cathodic analysis
     ci=np.where(Es<Ec)[0]
     if len(ci)>=8:
-        lc=sm(slog(ai[ci]),min(15,(len(ci)//2)*2-1 or 5))
+        lc=sm(slog(ai[ci]),min(11,(len(ci)//2)*2-1 or 5))
         dl=np.abs(np.gradient(lc,Es[ci]))
         thr=np.percentile(dl,20); flat=dl<max(thr,0.5)
         runs=[(k2,list(g)) for k2,g in groupby(enumerate(flat),key=lambda x:x[1]) if k2]
@@ -364,7 +305,8 @@ def detect(E, i):
             if len(idxs)>=4 and er>0.03 and abs(Es[ci[idxs[0]]]-Ec)>0.06:
                 reg.update(iL=float(np.median(ai[ci[idxs]])),
                            Els=float(Es[ci[idxs[0]]]),Ele=float(Es[ci[idxs[-1]]]))
-        # H2 evolution heuristic
+
+        # H2 evolution detection
         if "iL" in reg:
             very_neg = ci[Es[ci] < reg["Ele"]-0.02]
             if len(very_neg) >= 5:
@@ -389,7 +331,7 @@ def detect(E, i):
                         reg["has_H2"]=True
                 except: pass
 
-    # Anodic
+    # Anodic analysis
     ani=np.where(Es>Ec)[0]
     if len(ani)<6:
         if "iL" in reg:
@@ -401,7 +343,7 @@ def detect(E, i):
     log_a=sm(slog(ai[ani]),min(15,(len(ani)//2)*2-1 or 5))
     dlog=np.gradient(log_a,Es[ani]); adl=np.abs(dlog)
 
-    # Peaks
+    # Anodic peaks
     peaks=[]
     if len(ani)>20:
         ism=sm(ai[ani],min(21,(len(ani)//2)*2-1 or 5))
@@ -415,7 +357,7 @@ def detect(E, i):
                                                 E=float(Es[ani[pk]]),prom=float(prom)))
     reg["peaks"]=peaks
 
-    # Passive
+    # Passive regions (flat)
     thr_p=np.percentile(adl,25); flat=adl<max(thr_p,0.8)
     runs=[(k2,list(g)) for k2,g in groupby(enumerate(flat),key=lambda x:x[1]) if k2]
     pr=[]
@@ -433,7 +375,7 @@ def detect(E, i):
     if len(pr)>=2:
         reg["p2"]=pr[1]; reg["Esp"]=pr[1]["Es"]; reg["ipass2"]=pr[1]["ip"]
 
-    # Breakdown
+    # Breakdown/transpassive
     if "p1" in reg:
         pe_sort = np.where(Es == reg["p1"]["Ee"])[0]
         if len(pe_sort)>0 and pe_sort[0]+5<n:
@@ -466,6 +408,7 @@ def init_guess(E, i, reg):
     Ec=reg["Ecorr"]; ai=np.abs(i); lg=slog(i)
     ba0,bc0,ic0=0.060,0.120,max(ai[reg["eci"]],1e-12)
 
+    # Tafel slopes via grid search
     Epp=reg.get("Epp",Ec+0.50)
     for lo in np.arange(0.005,0.05,0.005):
         for hi in np.arange(lo+0.02,min(lo+0.18,Epp-Ec-0.005),0.005):
@@ -487,7 +430,8 @@ def init_guess(E, i, reg):
         else: continue
         break
 
-    Emax=float(np.max(E))
+    Emax=float(np.max(E)); Emin=float(np.min(E))
+    # Rs initial guess = 0
     return np.array([
         Ec,                                         # 0  Ecorr
         ic0,                                        # 1  icorr
@@ -509,10 +453,10 @@ def init_guess(E, i, reg):
     ])
 
 # ================================================================
-# OPTIMIZER (DE + L-BFGS-B + optional NM) with restarts
+# OPTIMIZER WITH ROBUST LOSSES
 # ================================================================
 class Optimizer:
-    def __init__(self, E, i, reg, p0, i_cap_vec, fit_rs, rs_bounds, loss_cfg, opt_cfg):
+    def __init__(self, E, i, reg, p0, i_cap_vec, fit_rs, rs_bounds, loss_cfg):
         self.E=E
         self.i=i
         self.ld=slog(i)
@@ -521,19 +465,23 @@ class Optimizer:
         self.ct=reg["ct"]
         self.pfull=p0.copy()
 
+        # Free parameter indices: CT + optional Rs
         base_idx = CT.free_idx(self.ct)
         self.fidx = base_idx + ([16] if fit_rs else [])
         self.nf=len(self.fidx)
 
+        # Loss configuration
         self.loss_cfg = loss_cfg
-        self.opt_cfg = opt_cfg  # dict: use_de, de_pop, de_iter, lbfgs_maxiter, use_nm, nm_maxiter, restarts, jitter
 
         self.log=[]; self.best_p=p0.copy(); self.best_s=1e30
         self._bounds(rs_bounds)
 
     def _bounds(self, rs_bounds):
         p=self.pfull; reg=self.reg; Ec=p[0]; ic=max(p[1],1e-14)
-        Emax=float(np.max(self.E)); rs_lo, rs_hi = rs_bounds
+        Emax=float(np.max(self.E)); Emin=float(np.min(self.E))
+        rs_lo, rs_hi = rs_bounds
+
+        # Full bounds vector length NP
         self.lo=np.array([
             Ec-0.20, max(ic*1e-4,1e-15), 0.010, 0.010,
             max(reg.get("iL",1e-6)*0.01,1e-10),
@@ -574,6 +522,7 @@ class Optimizer:
                 if j in LOG_I else (self.lo[j],self.hi[j]) for j in self.fidx]
 
     def _loss(self, p):
+        # model
         try:
             im = gmodel(self.E, p, i_cap=self.i_cap_vec)
         except Exception:
@@ -584,17 +533,20 @@ class Optimizer:
         lt = self.loss_cfg.get("type","log_l2")
         if lt == "log_l2":
             return float(np.sum(res_log**2))
+
         elif lt == "hybrid":
-            alpha = float(self.loss_cfg.get("alpha", 0.7))
+            alpha = float(self.loss_cfg.get("alpha", 0.5))
             scale = float(self.loss_cfg.get("linear_scale", np.median(np.abs(self.i))+1e-12))
             res_lin = (self.i - im) / (scale if scale>0 else 1.0)
             return float(alpha*np.sum(res_log**2) + (1.0-alpha)*np.sum(res_lin**2))
+
         elif lt == "huber_log":
             delta = float(self.loss_cfg.get("delta", 0.3))
             ares = np.abs(res_log)
             quad = ares <= delta
             loss = np.where(quad, 0.5*res_log**2, delta*(ares - 0.5*delta))
             return float(np.sum(loss))
+
         else:
             return float(np.sum(res_log**2))
 
@@ -614,19 +566,6 @@ class Optimizer:
         self.log.append(f"  {tag}: R²={rv:.6f} (no impr.)")
         return False
 
-    def _local_restart(self, base_x, label, maxiter=1500, jitter=0.06):
-        bnds = self._pbounds()
-        width = np.array([b[1]-b[0] for b in bnds])
-        x0 = base_x + np.random.uniform(-jitter, jitter, size=len(base_x)) * width
-        x0 = np.clip(x0, [b[0] for b in bnds], [b[1] for b in bnds])
-        try:
-            t1=time.time()
-            r = minimize(self._obj, x0, method="L-BFGS-B", bounds=bnds,
-                         options={"maxiter":int(maxiter),"ftol":1e-12,"gtol":1e-10})
-            self._up(r.x, f"{label} ({time.time()-t1:.1f}s)")
-        except Exception as ex:
-            self.log.append(f"  {label} err: {ex}")
-
     def run(self):
         t0=time.time()
         title,_,_=CT.INFO.get(self.ct,("Unknown","",[]))
@@ -638,56 +577,34 @@ class Optimizer:
             rv0=0.0
         self.log.append(f"  Init: R²={rv0:.4f}")
         bnds=self._pbounds()
-
-        # Stage 1: DE (optional)
-        if self.opt_cfg.get("use_de", True):
-            ps=self.opt_cfg.get("de_pop", max(10, min(12, self.nf)))
-            mi=self.opt_cfg.get("de_iter", 300)
-            self.log.append(f"Stage 1: DE  pop={ps} iter={mi}")
-            try:
-                t1=time.time()
-                res=differential_evolution(
-                    self._obj, bnds, seed=42, maxiter=mi, tol=1e-9,
-                    popsize=ps, mutation=(0.5,1.0), recombination=0.85, polish=False
-                )
-                self._up(res.x,f"DE ({time.time()-t1:.1f}s)")
-            except Exception as ex:
-                self.log.append(f"  DE err: {ex}")
-        else:
-            self.log.append("Stage 1: DE skipped")
-
-        # Stage 2: L-BFGS-B (local)
+        # DE
+        ps=max(8,min(12,self.nf)); mi=max(150,min(500,self.nf*35))
+        self.log.append(f"Stage 1: DE  pop={ps} iter={mi}")
+        try:
+            t1=time.time()
+            res=differential_evolution(self._obj,bnds,seed=42,maxiter=mi,tol=1e-12,
+                popsize=ps,mutation=(0.5,1.5),recombination=0.9,polish=False)
+            self._up(res.x,f"DE ({time.time()-t1:.1f}s)")
+        except Exception as ex:
+            self.log.append(f"  DE err: {ex}")
+        # L-BFGS-B
         self.log.append("Stage 2: L-BFGS-B")
         try:
             t1=time.time()
-            r2v=minimize(
-                self._obj,self._pack(self.best_p),method="L-BFGS-B",bounds=bnds,
-                options={"maxiter":int(self.opt_cfg.get("lbfgs_maxiter", 2000)),"ftol":1e-12,"gtol":1e-10}
-            )
+            r2v=minimize(self._obj,self._pack(self.best_p),method="L-BFGS-B",bounds=bnds,
+                options={"maxiter":20000,"ftol":1e-15,"gtol":1e-12})
             self._up(r2v.x,f"L-BFGS-B ({time.time()-t1:.1f}s)")
         except Exception as ex:
             self.log.append(f"  L-BFGS-B err: {ex}")
-
-        # Stage 3: Nelder-Mead (optional)
-        if self.opt_cfg.get("use_nm", True):
-            self.log.append("Stage 3: Nelder-Mead")
-            try:
-                t1=time.time()
-                r3=minimize(self._obj,self._pack(self.best_p),method="Nelder-Mead",
-                    options={"maxiter":int(self.opt_cfg.get("nm_maxiter", 7000)),"xatol":1e-12,"fatol":1e-12,"adaptive":True})
-                self._up(r3.x,f"NM ({time.time()-t1:.1f}s)")
-            except Exception as ex:
-                self.log.append(f"  NM err: {ex}")
-        else:
-            self.log.append("Stage 3: NM skipped")
-
-        # Local restarts (multi-start)
-        restarts = int(self.opt_cfg.get("restarts", 3))
-        jitter = float(self.opt_cfg.get("jitter", 0.06))
-        if restarts > 0:
-            bx = self._pack(self.best_p)
-            for k in range(restarts):
-                self._local_restart(bx, f"Restart {k+1}", maxiter=self.opt_cfg.get("lbfgs_maxiter", 2000), jitter=jitter)
+        # Nelder-Mead
+        self.log.append("Stage 3: Nelder-Mead")
+        try:
+            t1=time.time()
+            r3=minimize(self._obj,self._pack(self.best_p),method="Nelder-Mead",
+                options={"maxiter":15000,"xatol":1e-13,"fatol":1e-15,"adaptive":True})
+            self._up(r3.x,f"NM ({time.time()-t1:.1f}s)")
+        except Exception as ex:
+            self.log.append(f"  NM err: {ex}")
 
         dt=time.time()-t0
         try:
@@ -701,8 +618,9 @@ class Optimizer:
 # ================================================================
 # DIAGNOSTICS
 # ================================================================
-def diagnose(E, i, reg, bp, rv, i_cap_vec):
+def diagnose(E, i, reg, bp, rv):
     issues=[]; ai=np.abs(i); lg=slog(i); n=len(E); Ec=reg["Ecorr"]
+    # Noise
     if n>20:
         lsm=sm(lg,min(21,(n//4)*2-1 or 5)); noise=np.std(lg-lsm)
         if noise>0.5: issues.append(("High noise",f"σ={noise:.2f} dec. Use slower scan rate or average scans.","e"))
@@ -710,7 +628,7 @@ def diagnose(E, i, reg, bp, rv, i_cap_vec):
         else: issues.append(("Low noise",f"σ={noise:.3f} dec.","o"))
     if bp is not None:
         if bp[2]*1000>200: issues.append(("Large βa",f"{bp[2]*1000:.0f} mV/dec — possible IR drop or multi-step mechanism.","w"))
-        if bp[3]*1000>200: issues.append(("Large βc₁",f"{bp[3]*1000:.0f} mV/dec — possible diffusion or IR drop.","w"))
+        if bp[3]*1000>200: issues.append(("Large βc₁",f"{bp[3]*1000:.0f} mV/dec — possible diffusion in Tafel region or IR drop.","w"))
         if bp[6]*1000>250: issues.append(("Large βc₂ (H₂)",f"{bp[6]*1000:.0f} mV/dec — may indicate coupled reactions.","w"))
         if bp[16] > 0.0:
             issues.append(("Uncompensated resistance", f"Rs ≈ {bp[16]:.2f} Ω·cm² — IR drop correction applied.", "o"))
@@ -718,18 +636,15 @@ def diagnose(E, i, reg, bp, rv, i_cap_vec):
     if Er<0.3: issues.append(("Narrow scan",f"{Er*1000:.0f} mV. May miss regions.","w"))
     if n/max(Er,0.01)<50: issues.append(("Low density",f"{n/max(Er,0.01):.0f} pts/V.","w"))
     if np.sum(np.abs(E-Ec)<0.05)<5: issues.append(("Sparse near Ecorr","<5 pts within ±50 mV.","w"))
+    # Residuals
     if bp is not None:
-        res=lg-slog(gmodel(E,bp, i_cap=i_cap_vec))
+        res=lg-slog(gmodel(E,bp))
         if n>10:
             nruns=np.sum(np.abs(np.diff(np.sign(res)))>0)+1
             if nruns<n*0.25: issues.append(("Systematic misfit",
                 f"{nruns} sign changes (expect ~{n//2}). Model may miss a feature.","w"))
-        masks = [
-            ("near Ecorr",np.abs(E-Ec)<0.05),
-            ("cathodic",E<Ec-0.1),
-            ("passive",(E>reg.get("Epp",99))&(E<reg.get("Eb",E[-1])) if bp is not None else np.zeros_like(E,dtype=bool))
-        ]
-        for name,mask in masks:
+        for name,mask in [("near Ecorr",np.abs(E-Ec)<0.05),
+            ("cathodic",E<Ec-0.1),("passive",(E>reg.get("Epp",99))&(E<reg.get("Eb",E[-1])) if bp is not None else np.zeros_like(E,dtype=bool))]:
             if mask.sum()>3:
                 rmse=np.sqrt(np.mean((res[mask])**2))
                 if rmse>0.5: issues.append((f"Poor fit: {name}",f"RMSE={rmse:.3f} dec.","w"))
@@ -768,9 +683,9 @@ def plot_main(E, i, bp, reg, ct, i_cap_vec):
             annotation=dict(text="Eb",font=dict(color="#f38ba8",size=10)))
     fig.add_trace(go.Scatter(x=E,y=lg,mode="lines",name="Measured",line=dict(color=CL["data"],width=2.5)))
     if bp is not None:
-        Em=np.linspace(np.min(E),np.max(E),800)
+        Em=np.linspace(np.min(E),np.max(E),1000)
         try:
-            im=gmodel(Em,bp)  # faradaic-only baseline
+            im=gmodel(Em,bp)  # plot faradaic-only curve for baseline
             rv=r2(lg,slog(gmodel(E,bp, i_cap=i_cap_vec)))
             fig.add_trace(go.Scatter(x=Em,y=slog(im),mode="lines",
                 name=f"Global Fit (faradaic)  R²(log)={rv:.4f}",line=dict(color=CL["fit"],width=3)))
@@ -786,11 +701,9 @@ def plot_main(E, i, bp, reg, ct, i_cap_vec):
         height=540,margin=dict(l=70,r=20,t=50,b=60),hovermode="x unified")
     return fig
 
-def plot_comp(E, bp, ct):
+def plot_comp(E, bp, ct, i_cap_vec):
     if bp is None: return None
-    Em=np.linspace(np.min(E),np.max(E),500)
-    c=gcomp(Em,bp)  # no i_cap for clarity
-    fig=go.Figure()
+    Em=np.linspace(np.min(E),np.max(E),800); c=gcomp(Em,bp, i_cap=i_cap_vec*0.0); fig=go.Figure()
     fig.add_trace(go.Scatter(x=Em,y=slog(c["ic1"]),mode="lines",name="O₂ cathodic",
         line=dict(color=CL["cathodic"],width=1.5,dash="dot")))
     fig.add_trace(go.Scatter(x=Em,y=slog(c["ic2"]),mode="lines",name="H₂ cathodic",
@@ -905,109 +818,39 @@ MATS={"Carbon Steel / Iron":(27.92,7.87),"304 Stainless Steel":(25.10,7.90),
     "316 Stainless Steel":(25.56,8.00),"Copper":(31.77,8.96),"Aluminum":(8.99,2.70),
     "Nickel":(29.36,8.91),"Titanium":(11.99,4.51),"Zinc":(32.69,7.14),"Custom":(27.92,7.87)}
 
-def process(E_full, i_full, area, ew, rho, cap_cfg_ui, fit_rs_ui, rs_bounds, loss_cfg_ui,
-            speed_mode, max_fit_points, show_components, use_full_fit, escalate_r2, restarts, jitter):
-    # Capacitive current vector (full) from UI
-    if cap_cfg_ui.get("include", False):
-        sgn = scan_direction_sign(E_full)
-        i_cap_vec_full = cap_cfg_ui["Cdl"] * cap_cfg_ui["nu"] * sgn
+def process(E, i_d, area, ew, rho, cap_cfg, fit_rs, rs_bounds, loss_cfg):
+    # Capacitive current vector
+    if cap_cfg.get("include", False):
+        sgn = scan_direction_sign(E)
+        i_cap_vec = cap_cfg["Cdl"] * cap_cfg["nu"] * sgn
     else:
-        i_cap_vec_full = np.zeros_like(E_full)
+        i_cap_vec = np.zeros_like(E)
 
-    prog=st.progress(0,text="Detecting regions (full data)...")
-    reg=detect(E_full,i_full); ct=reg["ct"]
+    # Detect using E-sorted copy
+    prog=st.progress(0,text="Detecting regions...")
+    reg=detect(E,i_d); ct=reg["ct"]
+    prog.progress(15,text="Initial estimates...")
+    p0=init_guess(E,i_d,reg)
 
-    # Stage A: Thinning (or full) — First pass without Rs and Cdl for stability
-    prog.progress(12,text=f"Selecting data for fitting...")
-    if use_full_fit:
-        E_fit, i_fit = E_full, i_full
-        i_cap_fit = np.zeros_like(E_fit)  # first pass: disable Cdl
-    else:
-        E_fit, i_fit, idx_fit = feature_preserving_thin(E_full, i_full, reg, max_points=max_fit_points)
-        i_cap_fit = np.zeros_like(E_fit)  # first pass: disable Cdl
+    # Prepare optimizer and run
+    prog.progress(25,text=f"Optimizing ({CT.nfree(ct)}+{'Rs' if fit_rs else '0'} params)...")
+    opt=Optimizer(E,i_d,reg,p0,i_cap_vec,fit_rs,rs_bounds,loss_cfg)
+    bp,rv=opt.run()
 
-    # Initial guess from full data for stability
-    prog.progress(20,text="Initial estimates...")
-    p0=init_guess(E_full,i_full,reg)
-
-    # Optimizer configs from speed mode
-    if speed_mode == "Fast":
-        opt_cfg_A = {"use_de": False, "lbfgs_maxiter": 1500, "use inline": False,
-                     "use_nm": False, "restarts": restarts, "jitter": jitter}
-    elif speed_mode == "Balanced":
-        opt_cfg_A = {"use_de": True, "de_pop": 10, "de_iter": 260,
-                     "lbfgs_maxiter": 1800, "use_nm": False,
-                     "restarts": restarts, "jitter": jitter}
-    else:  # Thorough
-        opt_cfg_A = {"use_de": True, "de_pop": 12, "de_iter": 360,
-                     "lbfgs_maxiter": 2200, "use_nm": True, "nm_maxiter": 6000,
-                     "restarts": restarts, "jitter": jitter}
-
-    # Stage A optimization (thinned/full, Rs OFF, Cdl OFF)
-    prog.progress(30,text=f"Stage A: optimizing (no Rs/Cdl)...")
-    optA=Optimizer(E_fit,i_fit,reg,p0,i_cap_fit,False,rs_bounds,{"type":"log_l2"},opt_cfg_A)
-    bpA,rvA=optA.run()
-
-    # Stage B: Thinned/full refine with UI Rs/Cdl options
-    prog.progress(55,text="Stage B: refine with UI Rs/Cdl...")
-    fit_rs_B = fit_rs_ui
-    i_cap_fit_B = (i_cap_vec_full if use_full_fit else i_cap_vec_full[idx_fit]) if cap_cfg_ui.get("include", False) else np.zeros_like(E_fit)
-    opt_cfg_B = opt_cfg_A.copy()
-    optB=Optimizer(E_fit,i_fit,reg,bpA,i_cap_fit_B,fit_rs_B,rs_bounds,loss_cfg_ui,opt_cfg_B)
-    bpB,rvB=optB.run()
-
-    # Stage C: Fallback escalation if needed
-    if rvB < escalate_r2:
-        prog.progress(72,text=f"Stage C: fallback (target R² ≥ {escalate_r2:.2f})...")
-        # Add more points if thinning was used
-        if not use_full_fit:
-            E_fit2, i_fit2, idx_fit2 = feature_preserving_thin(E_full, i_full, reg, max_points=min(len(E_full), max_fit_points*2))
-            i_cap_fit2 = i_cap_vec_full[idx_fit2] if cap_cfg_ui.get("include", False) else np.zeros_like(E_fit2)
-        else:
-            E_fit2, i_fit2 = E_fit, i_fit
-            i_cap_fit2 = i_cap_fit_B
-        # Stronger settings
-        opt_cfg_C = {"use_de": True, "de_pop": 12, "de_iter": 420,
-                     "lbfgs_maxiter": 2500, "use_nm": True, "nm_maxiter": 8000,
-                     "restarts": max(2,restarts), "jitter": max(0.05,jitter)}
-        optC=Optimizer(E_fit2,i_fit2,reg,bpB,i_cap_fit2,fit_rs_ui,rs_bounds,loss_cfg_ui,opt_cfg_C)
-        bpC,rvC=optC.run()
-        if rvC > rvB:
-            bpB, rvB, optB = bpC, rvC, optC
-
-    # Stage D: Final full-data refine (pure log L2) for maximum R²
-    prog.progress(90,text="Stage D: final full-data refine...")
-    # First refine without Rs/Cdl
-    opt_ref_cfg = {"use_de": False, "lbfgs_maxiter": 4000, "use_nm": False, "restarts": 0, "jitter": 0.0}
-    optRef=Optimizer(E_full,i_full,reg,bpB,np.zeros_like(E_full),False,rs_bounds,{"type":"log_l2"},opt_ref_cfg)
-    bp,rv=optRef.run()
-    # If UI enables Rs/Cdl, short refine with them enabled
-    if fit_rs_ui or cap_cfg_ui.get("include", False):
-        i_cap_vec_use = i_cap_vec_full if cap_cfg_ui.get("include", False) else np.zeros_like(E_full)
-        optRef2=Optimizer(E_full,i_full,reg,bp,i_cap_vec_use,fit_rs_ui,rs_bounds,{"type":"log_l2"}, {"use_de":False,"lbfgs_maxiter":2000,"use_nm":False,"restarts":0,"jitter":0.0})
-        bp,rv=optRef2.run()
-
-    # Diagnostics on full data
+    prog.progress(90,text="Diagnostics...")
+    diags=diagnose(E,i_d,reg,bp,rv)
     prog.progress(100,text="Done!"); prog.empty()
-    diags=diagnose(E_full,i_full,reg,bp,rv, i_cap_vec_full if cap_cfg_ui.get("include", False) else np.zeros_like(E_full))
 
     st.markdown("---")
-    st.plotly_chart(plot_main(E_full,i_full,bp,reg,ct, i_cap_vec_full if cap_cfg_ui.get("include", False) else np.zeros_like(E_full)),use_container_width=True)
+    st.plotly_chart(plot_main(E,i_d,bp,reg,ct,i_cap_vec),use_container_width=True)
     c1,c2=st.columns(2)
     with c1:
-        if show_components:
-            fc=plot_comp(E_full,bp,ct)
-            if fc: st.plotly_chart(fc,use_container_width=True)
-        else:
-            st.info("Component plot disabled.")
+        fc=plot_comp(E,bp,ct,i_cap_vec)
+        if fc: st.plotly_chart(fc,use_container_width=True)
     with c2:
-        fr=plot_res(E_full,i_full,bp, i guided := (i_cap_vec_full if cap_cfg_ui.get('include', False) else np.zeros_like(E_full)))
-        # Fallback if variable name issue:
-        if fr is None:
-            fr=plot_res(E_full,i_full,bp, i_cap_vec_full if cap_cfg_ui.get("include", False) else np.zeros_like(E_full))
+        fr=plot_res(E,i_d,bp,i_cap_vec)
         if fr: st.plotly_chart(fr,use_container_width=True)
-
-    st.markdown("---"); show_p(bp,reg,ew,rho,ct,rv,cap_cfg_ui)
+    st.markdown("---"); show_p(bp,reg,ew,rho,ct,rv,cap_cfg)
     st.markdown("---"); st.markdown("### Data Quality Diagnostics")
     for t,m,s in diags:
         cls={"e":"bx ber","w":"bx bwn","o":"bx bok"}[s]
@@ -1017,24 +860,23 @@ def process(E_full, i_full, area, ew, rho, cap_cfg_ui, fit_rs_ui, rs_bounds, los
         with st.expander("Model Equation"):
             p=dict(zip(PN,bp))
             st.markdown(f"""
-**Dual-Cathodic Film-Coverage Model (with optional Rs)**
+**Dual-Cathodic Film-Coverage Model (with Rs)**
 
-`i_net = i_anodic_total − (i_O₂ + i_H₂) + i_cap`
+i_net = i_anodic_total − (i_O₂ + i_H₂) + i_cap
 
-- O₂ (diff.-limited): `i_O₂ = i_kin / (1 + i_kin / iL)`, where `i_kin = icorr·exp(−2.303η/βc₁)`
-- H₂ (activation): `i_H₂ = i₀,c₂·exp(−2.303η/βc₂)`
-- Active anodic: `i_act = icorr·exp( 2.303η/βa )`
-- Primary passivation: `θ₁ = σ(k₁·(E−Epp))`, `i = i_act·(1−θ₁) + ipass·θ₁`
-- Transpassive: `i_tp = a_tp·exp(b_tp·(E−Eb))·σ(E−Eb)`
-- Secondary passivation: `θ₂ = σ(k₂·(E−Esp))`, `i_an = (i_p1+i_tp)·(1−θ₂) + ipass₂·θ₂`
+- O₂ (diff.-limited): i_O₂ = i_kin / (1 + i_kin / iL), where i_kin = icorr·exp(−2.303η/βc₁)
+- H₂ (activation): i_H₂ = i₀,c₂·exp(−2.303η/βc₂)
+- Active anodic: i_act = icorr·exp( 2.303η/βa )
+- Primary passivation: θ₁ = σ(k₁·(E−Epp)), i = i_act·(1−θ₁) + ipass·θ₁
+- Transpassive: i_tp = a_tp·exp(b_tp·(E−Eb))·σ(E−Eb)
+- Secondary passivation: θ₂ = σ(k₂·(E−Esp)), i_an = (i_p1+i_tp)·(1−θ₂) + ipass₂·θ₂
 
-Ohmic drop: `E_eff = E − Rs·i_net` (self-consistent iterations)
+Ohmic drop: E_eff = E − Rs·i_net (solved self-consistently)
 
 Fitted: Ecorr={p['Ecorr']:.4f} V, icorr={p['icorr']:.3e}, βa={p['ba']*1000:.1f}, βc₁={p['bc1']*1000:.1f} mV/dec, Rs={p['Rs']:.3f} Ω·cm²
 """)
     with st.expander("Optimization Log"):
-        for msg in optA.log + optB.log + (optRef.log if 'optRef' in locals() else []):
-            st.markdown(f"- {msg}")
+        for msg in opt.log: st.markdown(f"- {msg}")
     cd1,cd2=st.columns(2)
     with cd1:
         rows=[("Curve type",CT.INFO.get(ct,("?","",0))[0]),
@@ -1052,7 +894,7 @@ Fitted: Ecorr={p['Ecorr']:.4f} V, icorr={p['icorr']:.3e}, βa={p['ba']*1000:.1f}
             "tafel_results.csv","text/csv",use_container_width=True)
     with cd2:
         st.download_button("Data CSV",pd.DataFrame(
-            {"E_V":E_full,"i_Acm2":i_full,"log_abs_i":slog(i_full)}).to_csv(index=False).encode(),
+            {"E_V":E,"i_Acm2":i_d,"log_abs_i":slog(i_d)}).to_csv(index=False).encode(),
             "tafel_data.csv","text/csv",use_container_width=True)
 
 # ================================================================
@@ -1063,7 +905,7 @@ def main():
         border:1px solid #313244;border-radius:12px;padding:20px 28px;margin-bottom:20px">
       <h1 style="margin:0;color:#cdd6f4;font-size:26px">⚡ Tafel Fitting Tool</h1>
       <p style="margin:4px 0 0;color:#6c7086;font-size:13px">
-        Dual-cathodic global model · Film-coverage physics · Optional Rs & Cdl · Final full-data refine
+        Dual-cathodic global model · Film-coverage physics · Optional Rs & Cdl · Robust loss
       </p></div>""",unsafe_allow_html=True)
     with st.sidebar:
         st.markdown("### Settings")
@@ -1077,22 +919,12 @@ def main():
             ew,rho=ew0,rho0
 
         st.divider()
-        st.markdown("#### Speed & Quality")
-        speed_mode = st.selectbox("Speed mode", ["Fast","Balanced","Thorough"], index=2)
-        max_fit_points = st.slider("Max points for fitting (thinning)", 300, 4000, 1200, 50)
-        use_full_fit = st.checkbox("Use full dataset for fitting (skip thinning)", value=False)
-        show_components = st.checkbox("Show component plot", value=True)
-        escalate_r2 = st.slider("Fallback threshold R² (log)", 0.90, 0.995, 0.98, 0.005)
-        restarts = st.slider("Local restarts (multi-start)", 0, 8, 3, 1)
-        jitter = st.slider("Restart jitter (packed-space fraction)", 0.02, 0.20, 0.06, 0.01)
-
-        st.divider()
         st.markdown("#### Ohmic Drop (Rs)")
         enable_rs = st.checkbox("Fit Rs (Ω·cm²)", value=False)
         rs_lo = st.number_input("Rs lower bound (Ω·cm²)", 0.0, 1e4, 0.0, 0.1)
         rs_hi = st.number_input("Rs upper bound (Ω·cm²)", 0.0, 1e4, 200.0, 0.1)
         if not enable_rs:
-            st.caption("First pass ignores Rs for stability; final refine can re-enable if checked.")
+            st.caption("Rs fixed at 0.0 Ω·cm² (no IR compensation in parameters).")
 
         st.divider()
         st.markdown("#### Capacitive Current (Cdl · ν)")
@@ -1103,18 +935,18 @@ def main():
             st.warning("Scan rate is 0; capacitive current will be zero.")
 
         st.divider()
-        st.markdown("#### Loss Function (main fit)")
-        loss_type = st.selectbox("Type", ["Log L2", "Hybrid (log+linear)", "Huber (log)"], index=0)
-        alpha = st.slider("Hybrid weight α (log vs linear)", 0.0, 1.0, 0.7)
-        delta = st.slider("Huber δ (decades)", 0.05, 1.0, 0.30)
+        st.markdown("#### Loss Function")
+        loss_type = st.selectbox("Type", ["Log L2", "Hybrid (log+linear)", "Huber (log)"])
+        alpha = st.slider("Hybrid weight α (log vs linear)", 0.0, 1.0, 0.5)
+        delta = st.slider("Huber δ (decades)", 0.05, 1.0, 0.3)
         linear_scale = st.number_input("Linear residual scale (A/cm²)", 0.0, 1e3, 0.0, format="%.6f",
                                        help="If 0, auto uses median |i|.")
 
         st.divider()
         st.markdown("""<div style="font-size:11px;color:#a6adc8;line-height:1.6">
-        - First pass disables Rs/Cdl to find a stable basin.<br>
-        - Then refines with your Rs/Cdl settings and finally on full data for the best R².<br>
-        - Use Thorough mode and higher Max points for challenging curves.<br>
+        - Rs: self-consistent IR drop in the model.<br>
+        - Cdl·ν: adds capacitive current with scan-direction detection.<br>
+        - Robust loss: reduce outlier influence or balance low/high |i|.
         </div>""",unsafe_allow_html=True)
 
     up=st.file_uploader("Upload polarization data",type=["csv","txt","xlsx","xls"])
@@ -1131,26 +963,28 @@ def main():
     with st.expander(f"Detected: {ec} / {ic}",expanded=False):
         st.dataframe(df[[ec,ic]].head(10),use_container_width=True)
 
-    # Preserve original order (scan direction)
+    # Keep original order (no global sort) to preserve scan direction
     E=df[ec].values.astype(float)
     ir=df[ic].values.astype(float)*ifac
-    ok=np.isfinite(E)&np.isfinite(ir); E_full,ir=E[ok],ir[ok]
-    i_full = ir/area
+    ok=np.isfinite(E)&np.isfinite(ir); E,ir=E[ok],ir[ok]
+
+    # Normalize by area to current density
+    i_d = ir/area
 
     # Loss configuration
     lt = loss_type.lower()
+    loss_cfg = {}
     if lt.startswith("log l2"):
         loss_cfg = {"type": "log_l2"}
     elif lt.startswith("hybrid"):
-        loss_cfg = {"type":"hybrid","alpha":alpha,"linear_scale":(linear_scale if linear_scale>0 else np.median(np.abs(i_full))+1e-12)}
+        loss_cfg = {"type":"hybrid","alpha":alpha,"linear_scale":(linear_scale if linear_scale>0 else np.median(np.abs(i_d))+1e-12)}
     else:
         loss_cfg = {"type":"huber_log","delta":delta}
 
     cap_cfg = {"include": enable_cdl, "Cdl": cdl, "nu": nu}
     rs_bounds = (rs_lo, rs_hi)
 
-    process(E_full, i_full, area, ew, rho, cap_cfg, enable_rs, rs_bounds, loss_cfg,
-            speed_mode, max_fit_points, show_components, use_full_fit, escalate_r2, restarts, jitter)
+    process(E, i_d, area, ew, rho, cap_cfg, enable_rs, rs_bounds, loss_cfg)
 
 if __name__=="__main__":
     main()
