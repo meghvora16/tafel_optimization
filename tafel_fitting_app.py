@@ -863,7 +863,7 @@ if __name__=="__main__":
     if "demo" in st.session_state:
         st.markdown('<div style="background:linear-gradient(135deg,#1e1e2e,#131320);'
             'border:1px solid #313244;border-radius:12px;padding:20px 28px;margin-bottom:20px">'
-            '<h1 style="margin:0;color:#cdd6f4;font-size:26px">⚡ Tafel v5</h1></div>',unsafe_allow_html=True)
+            '<h1 style="margin:0;color:#cdd6f4;font-size:26px">⚡ Tafel Fitting Tool</h1></div>',unsafe_allow_html=True)
         with st.sidebar:
             area=st.number_input("Area",0.001,100.0,1.0)
             mat=st.selectbox("Material",list(MATS.keys()))
