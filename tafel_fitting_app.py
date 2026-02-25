@@ -277,6 +277,60 @@ class CT:
         return len(CT.free_idx(ct))
 
 # ================================================================
+# ROBUST Ecorr DETECTOR
+# ================================================================
+def _robust_ecorr(Es, is_):
+    """
+    Robustly select Ecorr:
+    - Smooth current to suppress spurious sign flips.
+    - Find all zero crossings on smoothed current.
+    - Score each crossing by local minimum |i| in a small window; choose smallest.
+    - Fall back to global min |i| if no crossings.
+    """
+    n = len(Es)
+    if n == 0:
+        return 0.0, 0
+
+    # Light smoothing
+    try:
+        w = min(11, n if n % 2 == 1 else n - 1)
+        i_sm = savgol_filter(is_, max(5, w), 3) if n >= 7 else is_.copy()
+    except Exception:
+        i_sm = is_.copy()
+
+    # Noise scale guard (MAD)
+    mad = np.median(np.abs(i_sm - np.median(i_sm))) + 1e-20
+    thr = 3.0 * mad
+
+    # All zero-crossing candidates
+    sc = np.where(np.sign(i_sm[:-1]) * np.sign(i_sm[1:]) < 0)[0]
+    # Optional: keep crossings where at least one side is above noise
+    sc = [k for k in sc if (abs(i_sm[k]) > thr or abs(i_sm[k+1]) > thr)]
+
+    if len(sc) == 0:
+        k = int(np.argmin(np.abs(i_sm)))
+        return float(Es[k]), int(k)
+
+    cands = []
+    for k in sc:
+        i1, i2 = i_sm[k], i_sm[k+1]
+        if i2 == i1:
+            continue
+        # Linear interpolation for Ecorr at zero crossing
+        Ec = Es[k] - i1 * (Es[k+1] - Es[k]) / (i2 - i1)
+        # Score by local minimum |i| around k
+        iwin = np.abs(i_sm[max(0, k-3):min(n, k+4)]).min()
+        cands.append((iwin, k, Ec))
+
+    if not cands:
+        k = int(np.argmin(np.abs(i_sm)))
+        return float(Es[k]), int(k)
+
+    cands.sort(key=lambda t: t[0])  # smallest local |i|
+    _, ksel, Ec = cands[0]
+    return float(Ec), int(ksel)
+
+# ================================================================
 # REGION DETECTION (uses potential-sorted copy for stability)
 # ================================================================
 def detect(E, i):
@@ -284,15 +338,10 @@ def detect(E, i):
     Es = E[idx_sort]; is_ = i[idx_sort]
     reg={}; n=len(Es); ai=np.abs(is_)
 
-    # Ecorr
-    sc=np.where(np.diff(np.sign(is_)))[0]
-    if len(sc)>0:
-        k=sc[0]; d=is_[k+1]-is_[k]
-        reg["Ecorr"]=float(Es[k]-is_[k]*(Es[k+1]-Es[k])/d) if abs(d)>0 else float(Es[k])
-        reg["eci"]=int(idx_sort[k])
-    else:
-        k=int(np.argmin(ai)); reg["Ecorr"]=float(Es[k]); reg["eci"]=int(idx_sort[k])
-    Ec=reg["Ecorr"]
+    # Robust Ecorr
+    Ec, ksel = _robust_ecorr(Es, is_)
+    reg["Ecorr"] = Ec
+    reg["eci"] = int(idx_sort[ksel])
 
     # Cathodic analysis
     ci=np.where(Es<Ec)[0]
@@ -505,6 +554,13 @@ class Optimizer:
             200.0, max(p[15]*100 if "p2" in reg else 1e-4,1e-4),
             max(rs_hi, 0.0)  # Rs
         ])
+
+        # Optional: fix Ecorr tightly if override enabled
+        if reg.get("fix_Ecorr", False):
+            tol = max(reg.get("Ecorr_tol", 0.002), 1e-6)  # V
+            self.lo[0] = self.pfull[0] - tol
+            self.hi[0] = self.pfull[0] + tol
+
         for j in range(NP):
             if self.lo[j]>=self.hi[j]:
                 m=self.pfull[j]; self.lo[j]=m-abs(m)*0.5-1e-6; self.hi[j]=m+abs(m)*0.5+1e-6
@@ -819,7 +875,7 @@ MATS={"Carbon Steel / Iron":(27.92,7.87),"304 Stainless Steel":(25.10,7.90),
     "316 Stainless Steel":(25.56,8.00),"Copper":(31.77,8.96),"Aluminum":(8.99,2.70),
     "Nickel":(29.36,8.91),"Titanium":(11.99,4.51),"Zinc":(32.69,7.14),"Custom":(27.92,7.87)}
 
-def process(E, i_d, area, ew, rho, cap_cfg, fit_rs, rs_bounds, loss_cfg):
+def process(E, i_d, area, ew, rho, cap_cfg, fit_rs, rs_bounds, loss_cfg, ec_override):
     # Capacitive current vector
     if cap_cfg.get("include", False):
         sgn = scan_direction_sign(E)
@@ -830,8 +886,23 @@ def process(E, i_d, area, ew, rho, cap_cfg, fit_rs, rs_bounds, loss_cfg):
     # Detect using E-sorted copy
     prog=st.progress(0,text="Detecting regions...")
     reg=detect(E,i_d); ct=reg["ct"]
+
+    # Optional manual Ecorr override
+    if ec_override.get("enabled", False):
+        Ec_user = float(ec_override.get("value", reg["Ecorr"]))
+        tol_v = float(ec_override.get("tol_v", 0.002))
+        reg["Ecorr"] = Ec_user
+        # closest index for display
+        reg["eci"] = int(np.argmin(np.abs(E - Ec_user)))
+        reg["fix_Ecorr"] = True
+        reg["Ecorr_tol"] = tol_v
+
     prog.progress(15,text="Initial estimates...")
     p0=init_guess(E,i_d,reg)
+
+    # Ensure p0 uses overridden Ecorr
+    if reg.get("fix_Ecorr", False):
+        p0[0] = reg["Ecorr"]
 
     # Prepare optimizer and run
     prog.progress(25,text=f"Optimizing ({CT.nfree(ct)}+{'Rs' if fit_rs else '0'} params)...")
@@ -911,7 +982,7 @@ def main():
         border:1px solid #313244;border-radius:12px;padding:20px 28px;margin-bottom:20px">
       <h1 style="margin:0;color:#cdd6f4;font-size:26px">⚡ Tafel Fitting Tool</h1>
       <p style="margin:4px 0 0;color:#6c7086;font-size:13px">
-        Dual-cathodic global model · Film-coverage physics · Optional Rs & Cdl · Robust loss
+        Dual-cathodic global model · Film-coverage physics · Optional Rs & Cdl · Robust loss · Robust Ecorr
       </p></div>""",unsafe_allow_html=True)
     with st.sidebar:
         st.markdown("### Settings")
@@ -949,7 +1020,15 @@ def main():
                                        help="If 0, auto uses median |i|.")
 
         st.divider()
+        st.markdown("#### Ecorr override (optional)")
+        ecorr_override_en = st.checkbox("Manually set Ecorr", value=False)
+        ecorr_user = st.number_input("Ecorr (V vs Ref)", -10.0, 10.0, 0.0, format="%.6f")
+        ecorr_band_mv = st.number_input("Fix Ecorr within ± (mV)", 0.0, 50.0, 2.0, format="%.1f",
+                                        help="Bounds Ecorr during optimization to ± this band.")
+
+        st.divider()
         st.markdown("""<div style="font-size:11px;color:#a6adc8;line-height:1.6">
+        - Robust Ecorr: selects crossing closest to local minimum |i|.<br>
         - Rs: self-consistent IR drop in the model.<br>
         - Cdl·ν: adds capacitive current with scan-direction detection.<br>
         - Robust loss: reduce outlier influence or balance low/high |i|.
@@ -989,8 +1068,13 @@ def main():
 
     cap_cfg = {"include": enable_cdl, "Cdl": cdl, "nu": nu}
     rs_bounds = (rs_lo, rs_hi)
+    ec_override = {
+        "enabled": ecorr_override_en,
+        "value": ecorr_user,
+        "tol_v": ecorr_band_mv/1000.0  # mV → V
+    }
 
-    process(E, i_d, area, ew, rho, cap_cfg, enable_rs, rs_bounds, loss_cfg)
+    process(E, i_d, area, ew, rho, cap_cfg, enable_rs, rs_bounds, loss_cfg, ec_override)
 
 if __name__=="__main__":
     main()
