@@ -880,13 +880,13 @@ Fitted: Ecorr={p['Ecorr']:.4f} V, icorr={p['icorr']:.3e}, βa={p['ba']*1000:.1f}
         for msg in opt.log: st.markdown(f"- {msg}")
     cd1,cd2=st.columns(2)
     with cd1:
-    if bp is not None:
+      if bp is not None:
         results_simple = {
             "Ecorr (V)": bp[0],
             "icorr (A/cm²)": bp[1],
             "R2(log)": rv
         }
-    else:
+      else:
         results_simple = {
             "Ecorr (V)": None,
             "icorr (A/cm²)": None,
