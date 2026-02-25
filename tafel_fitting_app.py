@@ -880,20 +880,24 @@ Fitted: Ecorr={p['Ecorr']:.4f} V, icorr={p['icorr']:.3e}, βa={p['ba']*1000:.1f}
         for msg in opt.log: st.markdown(f"- {msg}")
     cd1,cd2=st.columns(2)
     with cd1:
-        rows=[("Curve type",CT.INFO.get(ct,("?","",0))[0]),
-            ("Ecorr (V)",bp[0] if bp is not None else None),
-            ("icorr (A/cm2)",bp[1] if bp is not None else None),
-            ("ba (mV/dec)",bp[2]*1000 if bp is not None else None),
-            ("bc1 (mV/dec)",bp[3]*1000 if bp is not None else None),
-            ("iL (A/cm2)",bp[4] if bp is not None else None),
-            ("i0_c2 (A/cm2)",bp[5] if bp is not None else None),
-            ("bc2 (mV/dec)",bp[6]*1000 if bp is not None else None),
-            ("Rs (Ω·cm2)",bp[16] if bp is not None else None),
-            ("R2(log)",rv)]
-        for t,m,s in diags: rows.append((t,m))
-        st.download_button("Results CSV",
-                           pd.DataFrame(rows,columns=["Parameter","Value"]).to_csv(index=False).encode(),
-                           "tafel_results.csv","text/csv", key="dl_results")
+    if bp is not None:
+        results_simple = {
+            "Ecorr (V)": bp[0],
+            "icorr (A/cm²)": bp[1],
+            "R2(log)": rv
+        }
+    else:
+        results_simple = {
+            "Ecorr (V)": None,
+            "icorr (A/cm²)": None,
+            "R2(log)": None
+        }
+
+    df_results = pd.DataFrame([results_simple])
+
+    st.download_button("Results CSV",
+                       df_results.to_csv(index=False).encode(),
+                       "tafel_results.csv", "text/csv", key="dl_results")
     with cd2:
         st.download_button("Data CSV",
                            pd.DataFrame({"E_V":E,"i_Acm2":i_d,"log_abs_i":slog(i_d)}).to_csv(index=False).encode(),
