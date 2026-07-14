@@ -40,7 +40,7 @@ section[data-testid="stFileUploadDropzone"]{background:#1e1e2e!important;
 CL = dict(data="#89b4fa",anodic="#f9e2af",cathodic="#cba6f7",cat2="#f5c2e7",
     fit="#a6e3a1",passive="rgba(166,227,161,0.10)",limiting="rgba(137,220,235,0.10)",
     tp="rgba(243,188,168,0.08)",sp="rgba(203,166,247,0.08)",
-    ecorr="#f38ba8",grid="#313244",bg="#1e1e2e",paper="#131320",tx="#cdd6f4")
+    ecorr="#f38ba8",ecorr_fit="#fab387",grid="#313244",bg="#1e1e2e",paper="#131320",tx="#cdd6f4")
 
 # ================================================================
 # FILE I/O
@@ -92,7 +92,12 @@ def load_file(f):
 # ================================================================
 # MATH & HELPERS
 # ================================================================
-def slog(x): return np.log10(np.maximum(np.abs(x),1e-20))
+def slog(x, floor=1e-20):
+    """log10(|x|) with a configurable floor. A larger floor tames the
+    explosion of log-residuals that happens when |i| approaches the
+    instrument noise floor (which is exactly what happens near Ecorr)."""
+    return np.log10(np.maximum(np.abs(x), floor))
+
 def sm(y,w=11,p=3):
     n=len(y); w=min(w,n if n%2==1 else n-1)
     return savgol_filter(y,w,min(p,w-1)) if w>=5 else y.copy()
@@ -100,6 +105,16 @@ def r2(yt,yp):
     sr=np.sum((yt-yp)**2); st_=np.sum((yt-yt.mean())**2)
     return float(max(0,1-sr/st_)) if st_>0 else 0.0
 def sig(x,k=1.0): return 1.0/(1.0+np.exp(-np.clip(k*x,-50,50)))
+
+def estimate_noise_floor(i_d, k=5):
+    """Estimate the instrument current-noise floor from the k smallest
+    |i| values in the whole sweep. Near Ecorr the true faradaic current
+    crosses zero, so the smallest recorded |i| values are dominated by
+    noise rather than signal -- their magnitude is a good floor estimate."""
+    ai = np.abs(i_d)
+    k = max(1, min(k, len(ai)))
+    floor = float(np.mean(np.sort(ai)[:k]))
+    return max(floor, 1e-15)
 
 def scan_direction_sign(E):
     """Estimate sign of dE/dt from sequence; returns array (+1/-1) per point."""
@@ -505,14 +520,24 @@ def init_guess(E, i, reg):
 # OPTIMIZER WITH ROBUST LOSSES
 # ================================================================
 class Optimizer:
-    def __init__(self, E, i, reg, p0, i_cap_vec, fit_rs, rs_bounds, loss_cfg):
+    def __init__(self, E, i, reg, p0, i_cap_vec, fit_rs, rs_bounds, loss_cfg,
+                 ecorr_window=0.04, ecorr_reg_weight=8.0, noise_floor=None):
         self.E=E
         self.i=i
-        self.ld=slog(i)
-        self.i_cap_vec = i_cap_vec
         self.reg=reg
         self.ct=reg["ct"]
         self.pfull=p0.copy()
+
+        # --- Noise-floor handling ---------------------------------------
+        # Near Ecorr the measured current crosses zero, so log10(|i|) is
+        # extremely sensitive to noise there. We clip both data and model
+        # currents to a floor before taking logs in the objective, so a
+        # handful of near-zero noisy points can't dominate the fit or drag
+        # Ecorr away from its well-determined crossing.
+        self.noise_floor = float(noise_floor) if noise_floor else 1e-20
+        self.ld = slog(self.i, floor=self.noise_floor)
+
+        self.i_cap_vec = i_cap_vec
 
         # Free parameter indices: CT + optional Rs
         base_idx = CT.free_idx(self.ct)
@@ -522,6 +547,15 @@ class Optimizer:
         # Loss configuration
         self.loss_cfg = loss_cfg
 
+        # --- Ecorr anchoring ---------------------------------------------
+        # p0[0] is the robustly-detected (or user-overridden) Ecorr. We trust
+        # it and only let the optimizer move away from it within a tight
+        # window, softly penalized, rather than the old +/-200 mV free-for-all
+        # that let Ecorr wander to wherever minimized log-residual noise.
+        self.ecorr_ref = float(p0[0])
+        self.ecorr_window = max(float(ecorr_window), 1e-4)
+        self.ecorr_reg_weight = max(float(ecorr_reg_weight), 0.0)
+
         self.log=[]; self.best_p=p0.copy(); self.best_s=1e30
         self._bounds(rs_bounds)
 
@@ -529,9 +563,10 @@ class Optimizer:
         p=self.pfull; reg=self.reg; Ec=p[0]; ic=max(p[1],1e-14)
         Emax=float(np.max(self.E))
         rs_lo, rs_hi = rs_bounds
+        ew = self.ecorr_window
 
         self.lo=np.array([
-            Ec-0.20, max(ic*1e-4,1e-15), 0.010, 0.010,
+            Ec-ew, max(ic*1e-4,1e-15), 0.010, 0.010,
             max(reg.get("iL",1e-6)*0.01,1e-10),
             max(ic*1e-6,1e-16), 0.04,
             p[7]-0.25 if "p1" in reg else Emax+5,
@@ -543,7 +578,7 @@ class Optimizer:
             max(rs_lo, 0.0)  # Rs
         ])
         self.hi=np.array([
-            Ec+0.20, min(ic*1e4,1e0), 0.500, 0.500,
+            Ec+ew, min(ic*1e4,1e0), 0.500, 0.500,
             max(reg.get("iL",1e0)*100,1e-2),
             max(ic*10,1e-6), 0.350,
             p[7]+0.25 if "p1" in reg else Emax+15,
@@ -581,28 +616,36 @@ class Optimizer:
             im = gmodel(self.E, p, i_cap=self.i_cap_vec)
         except Exception:
             return 1e30
-        ld_m = slog(im)
+        ld_m = slog(im, floor=self.noise_floor)
         res_log = self.ld - ld_m
 
         lt = self.loss_cfg.get("type","log_l2")
         if lt == "log_l2":
-            return float(np.sum(res_log**2))
+            s = float(np.sum(res_log**2))
 
         elif lt == "hybrid":
             alpha = float(self.loss_cfg.get("alpha", 0.5))
             scale = float(self.loss_cfg.get("linear_scale", np.median(np.abs(self.i))+1e-12))
             res_lin = (self.i - im) / (scale if scale>0 else 1.0)
-            return float(alpha*np.sum(res_log**2) + (1.0-alpha)*np.sum(res_lin**2))
+            s = float(alpha*np.sum(res_log**2) + (1.0-alpha)*np.sum(res_lin**2))
 
         elif lt == "huber_log":
             delta = float(self.loss_cfg.get("delta", 0.3))
             ares = np.abs(res_log)
             quad = ares <= delta
             loss = np.where(quad, 0.5*res_log**2, delta*(ares - 0.5*delta))
-            return float(np.sum(loss))
+            s = float(np.sum(loss))
 
         else:
-            return float(np.sum(res_log**2))
+            s = float(np.sum(res_log**2))
+
+        # Soft anchor: discourage Ecorr from drifting away from the
+        # robustly-detected crossing unless the data really demands it.
+        if self.ecorr_reg_weight > 0:
+            dE = (p[0] - self.ecorr_ref) / self.ecorr_window
+            s += self.ecorr_reg_weight * dE * dE
+
+        return s
 
     def _obj(self, x):
         p=self._unpack(x)
@@ -611,7 +654,7 @@ class Optimizer:
     def _up(self, x, tag):
         s=self._obj(x)
         try:
-            rv=r2(self.ld,slog(gmodel(self.E,self._unpack(x), i_cap=self.i_cap_vec)))
+            rv=r2(self.ld,slog(gmodel(self.E,self._unpack(x), i_cap=self.i_cap_vec),floor=self.noise_floor))
         except Exception:
             rv=0.0
         if s<self.best_s:
@@ -624,9 +667,11 @@ class Optimizer:
         t0=time.time()
         title,_,_=CT.INFO.get(self.ct,("Unknown","",[]))
         self.log.append(f"Curve: {title}  ({self.nf} free params)")
+        self.log.append(f"  Ecorr anchor: {self.ecorr_ref:.4f} V  (window ±{self.ecorr_window*1000:.0f} mV, weight={self.ecorr_reg_weight:.1f})")
+        self.log.append(f"  Noise floor: {self.noise_floor:.3e} A/cm²")
         x0=self._pack(self.pfull); self.best_s=self._obj(x0)
         try:
-            rv0=r2(self.ld,slog(gmodel(self.E,self.pfull, i_cap=self.i_cap_vec)))
+            rv0=r2(self.ld,slog(gmodel(self.E,self.pfull, i_cap=self.i_cap_vec),floor=self.noise_floor))
         except Exception:
             rv0=0.0
         self.log.append(f"  Init: R²={rv0:.4f}")
@@ -662,17 +707,18 @@ class Optimizer:
 
         dt=time.time()-t0
         try:
-            rv=r2(self.ld,slog(gmodel(self.E,self.best_p, i_cap=self.i_cap_vec)))
+            rv=r2(self.ld,slog(gmodel(self.E,self.best_p, i_cap=self.i_cap_vec),floor=self.noise_floor))
         except Exception:
             rv=0.0
+        ecorr_shift_mv = abs(self.best_p[0]-self.ecorr_ref)*1000
         q="Excellent" if rv>=0.995 else "Good" if rv>=0.97 else "Acceptable" if rv>=0.90 else "Poor"
-        self.log.append(f"Result: {q}  R²(log)={rv:.6f}  [{dt:.1f}s]")
+        self.log.append(f"Result: {q}  R²(log)={rv:.6f}  Ecorr shift={ecorr_shift_mv:.1f} mV  [{dt:.1f}s]")
         return self.best_p, rv
 
 # ================================================================
 # DIAGNOSTICS
 # ================================================================
-def diagnose(E, i, reg, bp, rv):
+def diagnose(E, i, reg, bp, rv, noise_floor=1e-20, ecorr_window=0.04):
     issues=[]; ai=np.abs(i); lg=slog(i); n=len(E); Ec=reg["Ecorr"]
     # Noise
     if n>20:
@@ -686,6 +732,16 @@ def diagnose(E, i, reg, bp, rv):
         if bp[6]*1000>250: issues.append(("Large βc₂ (H₂)",f"{bp[6]*1000:.0f} mV/dec — may indicate coupled reactions.","w"))
         if bp[16] > 0.0:
             issues.append(("Uncompensated resistance", f"Rs ≈ {bp[16]:.2f} Ω·cm² — IR drop correction applied.", "o"))
+        ecorr_shift = abs(bp[0]-Ec)
+        if ecorr_shift*1000 > 0.6*ecorr_window*1000:
+            issues.append(("Ecorr drifted near search-window edge",
+                f"Fitted Ecorr moved {ecorr_shift*1000:.1f} mV from the detected crossing ({Ec:.4f} V), "
+                f"close to the ±{ecorr_window*1000:.0f} mV window limit. Consider widening the window only "
+                "if you're confident the detected crossing is wrong, otherwise inspect the raw curve near Ecorr.","w"))
+        elif ecorr_shift*1000 > 5:
+            issues.append(("Ecorr shifted moderately",
+                f"Fitted Ecorr is {ecorr_shift*1000:.1f} mV from the detected crossing ({Ec:.4f} V). "
+                "Usually fine, but worth a visual check.","o"))
     Er=float(np.max(E)-np.min(E))
     if Er<0.3: issues.append(("Narrow scan",f"{Er*1000:.0f} mV. May miss regions.","w"))
     if n/max(Er,0.01)<50: issues.append(("Low density",f"{n/max(Er,0.01):.0f} pts/V.","w"))
@@ -706,6 +762,9 @@ def diagnose(E, i, reg, bp, rv):
         if bp[1]<1e-14: issues.append(("Very low icorr",f"{bp[1]:.2e}.","w"))
     if rv is not None and rv<0.90: issues.append(("Poor fit",
         f"R²(log)={rv:.4f}. Possible: coupled reactions, adsorption, roughness, artifacts.","e"))
+    issues.append(("Noise floor used in fit",
+        f"{noise_floor:.3e} A/cm² — currents below this are treated as indistinguishable from noise "
+        "when computing the fit objective (does not affect plotted data).","o"))
     return issues
 
 # ================================================================
@@ -728,7 +787,10 @@ def plot_main(E, i, bp, reg, ct, i_cap_vec):
             annotation=dict(text="Transpassive",font=dict(color="#fab387",size=10)))
     Ec=reg["Ecorr"]
     fig.add_vline(x=Ec,line=dict(color=CL["ecorr"],width=1.5,dash="dot"),
-        annotation=dict(text="Ecorr",font=dict(color=CL["ecorr"],size=10)))
+        annotation=dict(text="Ecorr (detected)",font=dict(color=CL["ecorr"],size=10)))
+    if bp is not None and abs(bp[0]-Ec) > 1e-4:
+        fig.add_vline(x=bp[0],line=dict(color=CL["ecorr_fit"],width=1.5,dash="dash"),
+            annotation=dict(text=f"Ecorr (fit, Δ={ (bp[0]-Ec)*1000:+.0f} mV)",font=dict(color=CL["ecorr_fit"],size=10)))
     if reg.get("Epp") and "p1" in reg:
         fig.add_vline(x=reg["Epp"],line=dict(color="#a6e3a1",width=1,dash="dot"),
             annotation=dict(text="Epp",font=dict(color="#a6e3a1",size=10)))
@@ -875,7 +937,8 @@ MATS={"Carbon Steel / Iron":(27.92,7.87),"304 Stainless Steel":(25.10,7.90),
     "316 Stainless Steel":(25.56,8.00),"Copper":(31.77,8.96),"Aluminum":(8.99,2.70),
     "Nickel":(29.36,8.91),"Titanium":(11.99,4.51),"Zinc":(32.69,7.14),"Custom":(27.92,7.87)}
 
-def process(E, i_d, area, ew, rho, cap_cfg, fit_rs, rs_bounds, loss_cfg, ec_override):
+def process(E, i_d, area, ew, rho, cap_cfg, fit_rs, rs_bounds, loss_cfg, ec_override,
+            ecorr_window, ecorr_reg_weight, noise_floor_cfg):
     # Capacitive current vector
     if cap_cfg.get("include", False):
         sgn = scan_direction_sign(E)
@@ -897,6 +960,14 @@ def process(E, i_d, area, ew, rho, cap_cfg, fit_rs, rs_bounds, loss_cfg, ec_over
         reg["fix_Ecorr"] = True
         reg["Ecorr_tol"] = tol_v
 
+    # Noise floor: auto-estimate from the smallest recorded |i| unless
+    # the user supplied a manual value.
+    if noise_floor_cfg.get("auto", True):
+        noise_floor = estimate_noise_floor(i_d, k=noise_floor_cfg.get("k", 5))
+    else:
+        noise_floor = max(float(noise_floor_cfg.get("value", 1e-9)), 1e-15)
+    reg["noise_floor"] = noise_floor
+
     prog.progress(15,text="Initial estimates...")
     p0=init_guess(E,i_d,reg)
 
@@ -906,11 +977,12 @@ def process(E, i_d, area, ew, rho, cap_cfg, fit_rs, rs_bounds, loss_cfg, ec_over
 
     # Prepare optimizer and run
     prog.progress(25,text=f"Optimizing ({CT.nfree(ct)}+{'Rs' if fit_rs else '0'} params)...")
-    opt=Optimizer(E,i_d,reg,p0,i_cap_vec,fit_rs,rs_bounds,loss_cfg)
+    opt=Optimizer(E,i_d,reg,p0,i_cap_vec,fit_rs,rs_bounds,loss_cfg,
+                  ecorr_window=ecorr_window,ecorr_reg_weight=ecorr_reg_weight,noise_floor=noise_floor)
     bp,rv=opt.run()
 
     prog.progress(90,text="Diagnostics...")
-    diags=diagnose(E,i_d,reg,bp,rv)
+    diags=diagnose(E,i_d,reg,bp,rv,noise_floor=noise_floor,ecorr_window=ecorr_window)
     prog.progress(100,text="Done!"); prog.empty()
 
     st.markdown("---")
@@ -945,6 +1017,10 @@ i_net = i_anodic_total − (i_O₂ + i_H₂) + i_cap
 
 Ohmic drop: E_eff = E − Rs·i_net (solved self-consistently)
 
+Ecorr is anchored to the detected crossing ({reg['Ecorr']:.4f} V) within a ±{ecorr_window*1000:.0f} mV
+window (regularization weight {ecorr_reg_weight:.1f}); currents below the noise floor
+({noise_floor:.2e} A/cm²) are treated as indistinguishable from zero in the fit objective.
+
 Fitted: Ecorr={p['Ecorr']:.4f} V, icorr={p['icorr']:.3e}, βa={p['ba']*1000:.1f}, βc₁={p['bc1']*1000:.1f} mV/dec, Rs={p['Rs']:.3f} Ω·cm²
 """)
     with st.expander("Optimization Log"):
@@ -954,13 +1030,19 @@ Fitted: Ecorr={p['Ecorr']:.4f} V, icorr={p['icorr']:.3e}, βa={p['ba']*1000:.1f}
       if bp is not None:
         results_simple = {
             "Ecorr (V)": bp[0],
+            "Ecorr_detected (V)": reg["Ecorr"],
+            "Ecorr_shift (mV)": (bp[0]-reg["Ecorr"])*1000,
             "icorr (A/cm²)": bp[1],
+            "noise_floor (A/cm²)": noise_floor,
             "R2(log)": rv
         }
       else:
         results_simple = {
             "Ecorr (V)": None,
+            "Ecorr_detected (V)": None,
+            "Ecorr_shift (mV)": None,
             "icorr (A/cm²)": None,
+            "noise_floor (A/cm²)": None,
             "R2(log)": None
         }
 
@@ -982,7 +1064,7 @@ def main():
         border:1px solid #313244;border-radius:12px;padding:20px 28px;margin-bottom:20px">
       <h1 style="margin:0;color:#cdd6f4;font-size:26px">⚡ Tafel Fitting Tool</h1>
       <p style="margin:4px 0 0;color:#6c7086;font-size:13px">
-        Dual-cathodic global model · Film-coverage physics · Optional Rs & Cdl · Robust loss · Robust Ecorr
+        Dual-cathodic global model · Film-coverage physics · Optional Rs & Cdl · Robust loss · Anchored Ecorr
       </p></div>""",unsafe_allow_html=True)
     with st.sidebar:
         st.markdown("### Settings")
@@ -994,6 +1076,24 @@ def main():
             rho=st.number_input("Density ρ (g cm⁻³)",0.5,25.0,rho0)
         else:
             ew,rho=ew0,rho0
+
+        st.divider()
+        st.markdown("#### Ecorr Fitting Control")
+        st.caption("Ecorr is auto-detected from the current zero-crossing, then only allowed to "
+                   "move within this window during optimization. This is the main fix for Ecorr "
+                   "drifting far from the observed crossing.")
+        ecorr_window_mv = st.slider("Ecorr search window (± mV)", 5, 200, 40, 5)
+        ecorr_reg_weight = st.slider("Ecorr anchor strength", 0.0, 50.0, 10.0, 0.5,
+                                     help="0 = free to roam the whole window; higher = strongly prefers "
+                                          "staying near the detected crossing unless the data clearly demands otherwise.")
+
+        st.divider()
+        st.markdown("#### Noise Floor")
+        st.caption("Currents at/below this floor are treated as noise in the fit (prevents the near-Ecorr "
+                   "dip from dominating the log-space fit).")
+        auto_noise = st.checkbox("Auto-detect noise floor", value=True)
+        manual_noise_floor = st.number_input("Manual noise floor (A/cm²)", 0.0, 1e-3, 1e-9, format="%.2e",
+                                             disabled=auto_noise)
 
         st.divider()
         st.markdown("#### Ohmic Drop (Rs)")
@@ -1029,6 +1129,8 @@ def main():
         st.divider()
         st.markdown("""<div style="font-size:11px;color:#a6adc8;line-height:1.6">
         - Robust Ecorr: selects crossing closest to local minimum |i|.<br>
+        - Ecorr anchor: keeps the fitted Ecorr near the detected crossing.<br>
+        - Noise floor: tames log-space blow-up near the current zero-crossing.<br>
         - Rs: self-consistent IR drop in the model.<br>
         - Cdl·ν: adds capacitive current with scan-direction detection.<br>
         - Robust loss: reduce outlier influence or balance low/high |i|.
@@ -1073,8 +1175,11 @@ def main():
         "value": ecorr_user,
         "tol_v": ecorr_band_mv/1000.0  # mV → V
     }
+    noise_floor_cfg = {"auto": auto_noise, "value": manual_noise_floor, "k": 5}
 
-    process(E, i_d, area, ew, rho, cap_cfg, enable_rs, rs_bounds, loss_cfg, ec_override)
+    process(E, i_d, area, ew, rho, cap_cfg, enable_rs, rs_bounds, loss_cfg, ec_override,
+            ecorr_window=ecorr_window_mv/1000.0, ecorr_reg_weight=ecorr_reg_weight,
+            noise_floor_cfg=noise_floor_cfg)
 
 if __name__=="__main__":
     main()
