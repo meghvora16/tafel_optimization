@@ -770,33 +770,38 @@ def diagnose(E, i, reg, bp, rv, noise_floor=1e-20, ecorr_window=0.04):
 # ================================================================
 # PLOTS
 # ================================================================
-def plot_main(E, i, bp, reg, ct, i_cap_vec):
+def plot_main(E, i, bp, reg, ct, i_cap_vec, show_regions=False):
+    """Main overlay plot. By default only Ecorr (detected/fit) and icorr are
+    annotated; set show_regions=True to bring back the Limiting/Passive/
+    Transpassive/Epp/Eb shading and vlines."""
     lg=slog(i); fig=go.Figure()
-    if "p1" in reg:
-        p=reg["p1"]; fig.add_vrect(x0=p["Es"],x1=p["Ee"],fillcolor=CL["passive"],layer="below",line_width=0,
-            annotation=dict(text="Passive",font=dict(color="#a6e3a1",size=11)))
-    if "p2" in reg:
-        p=reg["p2"]; fig.add_vrect(x0=p["Es"],x1=p["Ee"],fillcolor=CL["sp"],layer="below",line_width=0,
-            annotation=dict(text="2nd Passive",font=dict(color="#cba6f7",size=10)))
-    if "Els" in reg:
-        fig.add_vrect(x0=reg["Els"],x1=reg["Ele"],fillcolor=CL["limiting"],layer="below",line_width=0,
-            annotation=dict(text="Limiting",font=dict(color="#89dceb",size=11)))
-    if reg.get("Eb"):
-        te=reg.get("Esp",E[-1]) if "p2" in reg else E[-1]
-        fig.add_vrect(x0=reg["Eb"],x1=te,fillcolor=CL["tp"],layer="below",line_width=0,
-            annotation=dict(text="Transpassive",font=dict(color="#fab387",size=10)))
+    if show_regions:
+        if "p1" in reg:
+            p=reg["p1"]; fig.add_vrect(x0=p["Es"],x1=p["Ee"],fillcolor=CL["passive"],layer="below",line_width=0,
+                annotation=dict(text="Passive",font=dict(color="#a6e3a1",size=11)))
+        if "p2" in reg:
+            p=reg["p2"]; fig.add_vrect(x0=p["Es"],x1=p["Ee"],fillcolor=CL["sp"],layer="below",line_width=0,
+                annotation=dict(text="2nd Passive",font=dict(color="#cba6f7",size=10)))
+        if "Els" in reg:
+            fig.add_vrect(x0=reg["Els"],x1=reg["Ele"],fillcolor=CL["limiting"],layer="below",line_width=0,
+                annotation=dict(text="Limiting",font=dict(color="#89dceb",size=11)))
+        if reg.get("Eb"):
+            te=reg.get("Esp",E[-1]) if "p2" in reg else E[-1]
+            fig.add_vrect(x0=reg["Eb"],x1=te,fillcolor=CL["tp"],layer="below",line_width=0,
+                annotation=dict(text="Transpassive",font=dict(color="#fab387",size=10)))
     Ec=reg["Ecorr"]
     fig.add_vline(x=Ec,line=dict(color=CL["ecorr"],width=1.5,dash="dot"),
         annotation=dict(text="Ecorr (detected)",font=dict(color=CL["ecorr"],size=10)))
     if bp is not None and abs(bp[0]-Ec) > 1e-4:
         fig.add_vline(x=bp[0],line=dict(color=CL["ecorr_fit"],width=1.5,dash="dash"),
             annotation=dict(text=f"Ecorr (fit, Δ={ (bp[0]-Ec)*1000:+.0f} mV)",font=dict(color=CL["ecorr_fit"],size=10)))
-    if reg.get("Epp") and "p1" in reg:
-        fig.add_vline(x=reg["Epp"],line=dict(color="#a6e3a1",width=1,dash="dot"),
-            annotation=dict(text="Epp",font=dict(color="#a6e3a1",size=10)))
-    if reg.get("Eb"):
-        fig.add_vline(x=reg["Eb"],line=dict(color="#f38ba8",width=1,dash="dash"),
-            annotation=dict(text="Eb",font=dict(color="#f38ba8",size=10)))
+    if show_regions:
+        if reg.get("Epp") and "p1" in reg:
+            fig.add_vline(x=reg["Epp"],line=dict(color="#a6e3a1",width=1,dash="dot"),
+                annotation=dict(text="Epp",font=dict(color="#a6e3a1",size=10)))
+        if reg.get("Eb"):
+            fig.add_vline(x=reg["Eb"],line=dict(color="#f38ba8",width=1,dash="dash"),
+                annotation=dict(text="Eb",font=dict(color="#f38ba8",size=10)))
     fig.add_trace(go.Scatter(x=E,y=lg,mode="lines",name="Measured",line=dict(color=CL["data"],width=2.5)))
     if bp is not None:
         Em=np.linspace(np.min(E),np.max(E),1000)
@@ -938,7 +943,7 @@ MATS={"Carbon Steel / Iron":(27.92,7.87),"304 Stainless Steel":(25.10,7.90),
     "Nickel":(29.36,8.91),"Titanium":(11.99,4.51),"Zinc":(32.69,7.14),"Custom":(27.92,7.87)}
 
 def process(E, i_d, area, ew, rho, cap_cfg, fit_rs, rs_bounds, loss_cfg, ec_override,
-            ecorr_window, ecorr_reg_weight, noise_floor_cfg):
+            ecorr_window, ecorr_reg_weight, noise_floor_cfg, show_regions=False):
     # Capacitive current vector
     if cap_cfg.get("include", False):
         sgn = scan_direction_sign(E)
@@ -986,7 +991,7 @@ def process(E, i_d, area, ew, rho, cap_cfg, fit_rs, rs_bounds, loss_cfg, ec_over
     prog.progress(100,text="Done!"); prog.empty()
 
     st.markdown("---")
-    st.plotly_chart(plot_main(E,i_d,bp,reg,ct,i_cap_vec), width='stretch')
+    st.plotly_chart(plot_main(E,i_d,bp,reg,ct,i_cap_vec,show_regions=show_regions), width='stretch')
     c1,c2=st.columns(2)
     with c1:
         fc=plot_comp(E,bp,ct,i_cap_vec)
@@ -1076,6 +1081,11 @@ def main():
             rho=st.number_input("Density ρ (g cm⁻³)",0.5,25.0,rho0)
         else:
             ew,rho=ew0,rho0
+
+        st.divider()
+        st.markdown("#### Plot Display")
+        show_regions = st.checkbox("Show region shading (Limiting/Passive/Epp/Eb)", value=False,
+                                    help="Off = clean plot with only Ecorr and icorr annotated.")
 
         st.divider()
         st.markdown("#### Ecorr Fitting Control")
@@ -1179,7 +1189,7 @@ def main():
 
     process(E, i_d, area, ew, rho, cap_cfg, enable_rs, rs_bounds, loss_cfg, ec_override,
             ecorr_window=ecorr_window_mv/1000.0, ecorr_reg_weight=ecorr_reg_weight,
-            noise_floor_cfg=noise_floor_cfg)
+            noise_floor_cfg=noise_floor_cfg, show_regions=show_regions)
 
 if __name__=="__main__":
     main()
